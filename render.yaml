@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: sensor-backend
+    env: python
+    buildCommand: ""
+    startCommand: python server.py
+    plan: free
