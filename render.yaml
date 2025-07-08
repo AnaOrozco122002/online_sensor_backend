@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: sensor-backend
-    env: python
-    pythonVersion: 3.11.8  # ✅ Esta línea es clave
-    buildCommand: ""
-    startCommand: python server.py
-    plan: free
