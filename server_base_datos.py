@@ -1,7 +1,14 @@
 import asyncio
 import websockets
+import os
 import json
+import psycopg2
 from datetime import datetime
+
+# Conexión a la base de datos
+DATABASE_URL = os.environ.get("DATABASE_URL")
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
 
 async def handle_connection(websocket):
     print("✅ Cliente conectado.")
@@ -12,6 +19,25 @@ async def handle_connection(websocket):
 
             print(f"\n📩 {timestamp} - Datos recibidos:")
             print(json.dumps(data, indent=2))
+
+            # Insertar en base de datos
+            cursor.execute("""
+                INSERT INTO sensor_samples (
+                    timestamp, activity,
+                    accel_x, accel_y, accel_z,
+                    gyro_x, gyro_y, gyro_z
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, [
+                data["timestamp"],
+                data["activity"],
+                data["accelerometer"]["x"],
+                data["accelerometer"]["y"],
+                data["accelerometer"]["z"],
+                data["gyroscope"]["x"],
+                data["gyroscope"]["y"],
+                data["gyroscope"]["z"]
+            ])
+            conn.commit()
 
     except websockets.ConnectionClosed:
         print("❌ Cliente desconectado.")
