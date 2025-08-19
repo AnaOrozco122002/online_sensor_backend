@@ -1,7 +1,9 @@
 import asyncio
 import websockets
 import json
+import os  # ← Esta línea es OBLIGATORIA
 from datetime import datetime
+
 
 async def handle_connection(websocket):
     print("✅ Cliente conectado.")
