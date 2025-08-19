@@ -1,7 +1,7 @@
 import psycopg2
 
 # URL externa de tu base de datos (Render)
-DATABASE_URL = "postgresql://online_database_sensor_conect_user:J3Tx7edUNw2gTFDNx91qBcI6UwcaEatc@dpg-d2i9vp8gjchc73e86c10-a.oregon-postgres.render.com/online_database_sensor_conect"
+DATABASE_URL = ""
 
 # Conexión y creación de tabla
 conn = psycopg2.connect(DATABASE_URL)
