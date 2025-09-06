@@ -6,21 +6,27 @@ import asyncio
 import asyncpg
 import websockets
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 POOL: asyncpg.Pool | None = None
+PH = PasswordHasher()  # Argon2
 
+# ---------- SQL ----------
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-  id_usuario   TEXT PRIMARY KEY,
-  display_name TEXT,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen_at TIMESTAMPTZ
+  id_usuario    TEXT PRIMARY KEY,
+  display_name  TEXT,
+  password_hash TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at  TIMESTAMPTZ
 );
 """
 
+# Tabla windows con 49 columnas + FK a users
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
@@ -59,17 +65,26 @@ CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
 CREATE INDEX IF NOT EXISTS idx_windows_id_usuario  ON windows (id_usuario);
 """
 
+# Migraciones suaves (por si ya existía sin columnas nuevas)
 MIGRATE_SQL = """
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS password_hash TEXT;
+
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS id_usuario TEXT REFERENCES users(id_usuario);
 """
 
-UPSERT_USER_SQL = """
+UPSERT_USER_SEEN_SQL = """
 INSERT INTO users (id_usuario, display_name, last_seen_at)
 VALUES ($1, $2, NOW())
-ON CONFLICT (id_usuario) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
+ON CONFLICT (id_usuario) DO UPDATE SET
+  display_name = COALESCE(users.display_name, EXCLUDED.display_name),
+  last_seen_at = EXCLUDED.last_seen_at
 RETURNING id_usuario;
 """
+
+GET_USER_SQL = "SELECT id_usuario, password_hash FROM users WHERE id_usuario = $1"
+SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
 WINDOWS_INSERT_SQL = """
 INSERT INTO windows (
@@ -112,6 +127,7 @@ INSERT INTO windows (
 RETURNING id;
 """
 
+# ---------- Utils ----------
 def is_window_payload(d: Dict[str, Any]) -> bool:
     return isinstance(d, dict) and "features" in d and "start_time" in d and "end_time" in d
 
@@ -152,29 +168,44 @@ def _normi(v):
     except Exception:
         return None
 
-async def init_db():
-    try:
-        if not DATABASE_URL:
-            print("❌ DATABASE_URL no está configurada")
-            raise RuntimeError("DATABASE_URL missing")
-        print("🔌 Conectando a Postgres...")
-        global POOL
-        POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        async with POOL.acquire() as conn:
-            await conn.execute(CREATE_USERS_SQL)
-            await conn.execute(CREATE_WINDOWS_SQL)
-            await conn.execute(MIGRATE_SQL)
-        print("🗄️  DB lista (tablas/índices/columnas verificados).")
-    except Exception as e:
-        print(f"💥 Error init_db: {e}")
-        raise
+# ---------- Auth helpers ----------
+async def upsert_user_seen(conn: asyncpg.Connection, user_id: str, display_name: Optional[str]):
+    return await conn.fetchval(UPSERT_USER_SEEN_SQL, user_id, display_name)
 
+async def set_password(conn: asyncpg.Connection, user_id: str, password: str):
+    pwd_hash = PH.hash(password)
+    await conn.execute(SET_PASSWORD_SQL, user_id, pwd_hash)
+
+async def verify_password(conn: asyncpg.Connection, user_id: str, password: str) -> bool:
+    row = await conn.fetchrow(GET_USER_SQL, user_id)
+    if not row or not row["password_hash"]:
+        return False
+    try:
+        PH.verify(row["password_hash"], password)
+        return True
+    except VerifyMismatchError:
+        return False
+
+# ---------- DB init ----------
+async def init_db():
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL no está configurada"); raise RuntimeError("DATABASE_URL missing")
+    print("🔌 Conectando a Postgres...")
+    global POOL
+    POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with POOL.acquire() as conn:
+        await conn.execute(CREATE_USERS_SQL)
+        await conn.execute(CREATE_WINDOWS_SQL)
+        await conn.execute(MIGRATE_SQL)
+    print("🗄️  DB lista (tablas/índices/columnas verificados).")
+
+# ---------- Save window ----------
 async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
     user_id = item.get("id_usuario") or "anon"
-    user_name = None  # si algún día recibes display_name, asigna aquí
+    display_name = item.get("display_name")
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
@@ -189,7 +220,6 @@ async def save_window(item: Dict[str, Any]) -> int:
     n_muestras   = _normi(feats.get("n_muestras"))
     etiqueta     = activity if activity is not None else feats.get("etiqueta")
 
-    # Normaliza todos los floats (NaN/Inf -> NULL)
     def f(k): return _normf(feats.get(k))
 
     args = [
@@ -214,12 +244,52 @@ async def save_window(item: Dict[str, Any]) -> int:
     ]
 
     async with POOL.acquire() as conn:
-        # UPSERT del usuario
-        await conn.fetchval(UPSERT_USER_SQL, user_id, user_name)
-        # Insert de la ventana
+        # registra/actualiza presencia del usuario
+        await upsert_user_seen(conn, user_id, display_name)
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
     return win_id
 
+# ---------- Auth message handlers ----------
+async def handle_register(conn: asyncpg.Connection, msg: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = (msg.get("id_usuario") or "").strip()
+    display_name = (msg.get("display_name") or "").strip()
+    password = msg.get("password") or ""
+    if not user_id or not password:
+        return {"ok": False, "error": "missing_fields"}
+
+    # crear usuario si no existe; si existe y tiene password, error
+    row = await conn.fetchrow(GET_USER_SQL, user_id)
+    if row and row["password_hash"]:
+        return {"ok": False, "error": "user_exists"}
+
+    await upsert_user_seen(conn, user_id, display_name or None)
+    await set_password(conn, user_id, password)
+    return {"ok": True, "id_usuario": user_id, "display_name": display_name}
+
+async def handle_login(conn: asyncpg.Connection, msg: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = (msg.get("id_usuario") or "").strip()
+    password = msg.get("password") or ""
+    if not user_id or not password:
+        return {"ok": False, "error": "missing_fields"}
+    ok = await verify_password(conn, user_id, password)
+    if not ok:
+        return {"ok": False, "error": "invalid_credentials"}
+    await upsert_user_seen(conn, user_id, None)
+    return {"ok": True, "id_usuario": user_id}
+
+async def handle_change_password(conn: asyncpg.Connection, msg: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = (msg.get("id_usuario") or "").strip()
+    old_pwd = msg.get("old_password") or ""
+    new_pwd = msg.get("new_password") or ""
+    if not user_id or not old_pwd or not new_pwd:
+        return {"ok": False, "error": "missing_fields"}
+    ok = await verify_password(conn, user_id, old_pwd)
+    if not ok:
+        return {"ok": False, "error": "invalid_credentials"}
+    await set_password(conn, user_id, new_pwd)
+    return {"ok": True}
+
+# ---------- WS ----------
 async def handle_connection(websocket):
     peer = websocket.remote_address
     print(f"✅ Cliente conectado: {peer}")
@@ -232,6 +302,24 @@ async def handle_connection(websocket):
                 await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
                 continue
 
+            # Soporta mensajes tipo RPC de auth
+            if isinstance(data, dict) and "type" in data:
+                typ = data.get("type")
+                async with POOL.acquire() as conn:
+                    if typ == "register":
+                        resp = await handle_register(conn, data)
+                        await websocket.send(json.dumps(resp))
+                        continue
+                    elif typ == "login":
+                        resp = await handle_login(conn, data)
+                        await websocket.send(json.dumps(resp))
+                        continue
+                    elif typ == "change_password":
+                        resp = await handle_change_password(conn, data)
+                        await websocket.send(json.dumps(resp))
+                        continue
+
+            # Mensajes de ventanas
             items = data if isinstance(data, list) else [data]
             acks = []
             for item in items:
