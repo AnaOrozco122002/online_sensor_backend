@@ -17,7 +17,6 @@ POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
 
 # ---------- SQL ----------
-# Esquema final esperado (ids numéricos autoincrementales y FK real)
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
   id_usuario    BIGSERIAL PRIMARY KEY,
@@ -30,10 +29,26 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+CREATE_INTERVALS_SQL = """
+CREATE TABLE IF NOT EXISTS intervalos_label (
+  id          BIGSERIAL PRIMARY KEY,
+  session_id  TEXT UNIQUE NOT NULL,
+  user_id     BIGINT REFERENCES users(id_usuario),
+  label       TEXT NOT NULL,
+  reason      TEXT,
+  start_ts    TIMESTAMPTZ NOT NULL,
+  end_ts      TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_intervals_user ON intervalos_label (user_id);
+CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
+"""
+
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
-  id_usuario       BIGINT REFERENCES users(id_usuario),  -- FK real, permite NULL
+  id_usuario       BIGINT REFERENCES users(id_usuario),
+  session_id       BIGINT REFERENCES intervalos_label(id),  -- FK a intervalo
   received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   start_time       TIMESTAMPTZ NOT NULL,
   end_time         TIMESTAMPTZ NOT NULL,
@@ -65,19 +80,17 @@ CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC)
 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
 CREATE INDEX IF NOT EXISTS idx_windows_start_index ON windows (start_index);
 CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
-CREATE INDEX IF NOT EXISTS idx_windows_id_usuario  ON windows (id_usuario);
+CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
+CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# Migración defensiva mínima (no cambia tipos; asume que ya corriste la migración grande si venías de TEXT)
 MIGRATE_SQL = """
--- Asegura columnas en users
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
   ADD COLUMN IF NOT EXISTS birthday      DATE,
   ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
--- Índice sobre email si existe la columna
 DO $$
 BEGIN
   IF EXISTS (
@@ -98,9 +111,18 @@ RETURNING id_usuario, email, display_name, birthday
 """
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
+# Sesiones
+INSERT_INTERVAL_SQL = """
+INSERT INTO intervalos_label (session_id, user_id, label, reason, start_ts)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, session_id, label, reason, start_ts
+"""
+END_INTERVAL_SQL = "UPDATE intervalos_label SET end_ts = $2 WHERE id = $1 RETURNING id, end_ts"
+GET_INTERVAL_SQL = "SELECT id, user_id, session_id, label, reason, start_ts, end_ts FROM intervalos_label WHERE id = $1"
+
 WINDOWS_INSERT_SQL = """
 INSERT INTO windows (
-  id_usuario,
+  id_usuario, session_id,
   received_at, start_time, end_time, sample_count, sample_rate_hz,
   activity, features, samples_json,
   start_index, end_index, n_muestras, etiqueta,
@@ -118,23 +140,23 @@ INSERT INTO windows (
 
   acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range
 ) VALUES (
-  $1,
-  $2, $3, $4, $5, $6,
-  $7, $8::jsonb, $9::jsonb,
-  $10, $11, $12, $13,
+  $1, $2,
+  $3, $4, $5, $6, $7,
+  $8, $9::jsonb, $10::jsonb,
+  $11, $12, $13, $14,
 
-  $14, $15, $16, $17, $18,
-  $19, $20, $21, $22, $23,
-  $24, $25, $26, $27, $28,
+  $15, $16, $17, $18, $19,
+  $20, $21, $22, $23, $24,
+  $25, $26, $27, $28, $29,
 
-  $29, $30, $31, $32, $33,
-  $34, $35, $36, $37, $38,
-  $39, $40, $41, $42, $43,
+  $30, $31, $32, $33, $34,
+  $35, $36, $37, $38, $39,
+  $40, $41, $42, $43, $44,
 
-  $44, $45, $46, $47, $48,
-  $49, $50, $51, $52, $53,
+  $45, $46, $47, $48, $49,
+  $50, $51, $52, $53, $54,
 
-  $54, $55, $56, $57, $58
+  $55, $56, $57, $58, $59
 )
 RETURNING id;
 """
@@ -189,6 +211,13 @@ def _normi(v):
     except Exception:
         return None
 
+def _slugify_label(label: str) -> str:
+    base = re.sub(r'[^a-zA-Z0-9]+', '-', label.strip()).strip('-').lower()
+    if not base:
+        base = "session"
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return f"{base}-{ts}"
+
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
     print(f"📝 register_user: email={email}, name={display_name}, birthday={birthday_str}")
@@ -206,7 +235,7 @@ async def register_user(conn: asyncpg.Connection, email: str, display_name: Opti
     print(f"✅ register_user OK id={row['id_usuario']}")
     return {
         "ok": True,
-        "id_usuario": row["id_usuario"],  # entero autoincremental
+        "id_usuario": row["id_usuario"],
         "email": row["email"],
         "display_name": row["display_name"],
         "birthday": birthday_str
@@ -243,6 +272,22 @@ async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, 
     print("✅ change_password OK")
     return {"ok": True}
 
+# ---------- Sessions RPC ----------
+async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reason: Optional[str]):
+    if not label or not label.strip():
+        return {"ok": False, "code": "bad_label", "message": "Label requerido"}
+    session_id_txt = _slugify_label(label)
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    row = await conn.fetchrow(INSERT_INTERVAL_SQL, session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now)
+    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "label": row["label"], "start_ts": row["start_ts"].isoformat()}
+
+async def stop_session(conn: asyncpg.Connection, interval_id: int):
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    row = await conn.fetchrow(END_INTERVAL_SQL, interval_id, now)
+    if not row:
+        return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
+    return {"ok": True, "interval_id": row["id"], "end_ts": now.isoformat()}
+
 # ---------- DB init ----------
 async def init_db():
     if not DATABASE_URL:
@@ -252,6 +297,7 @@ async def init_db():
     POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with POOL.acquire() as conn:
         await conn.execute(CREATE_USERS_SQL)
+        await conn.execute(CREATE_INTERVALS_SQL)
         await conn.execute(CREATE_WINDOWS_SQL)
         await conn.execute(MIGRATE_SQL)
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
@@ -261,14 +307,17 @@ async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    # Esperamos id_usuario como número (int) o string numérica; permitimos None (guardará NULL en windows)
     uid_raw = item.get("id_usuario")
     user_id: Optional[int] = None
     if uid_raw is not None:
-        try:
-            user_id = int(uid_raw)
-        except Exception:
-            user_id = None  # si viene malformado, guardamos NULL para no romper FK
+        try: user_id = int(uid_raw)
+        except Exception: user_id = None
+
+    sess_raw = item.get("session_id")
+    interval_id: Optional[int] = None
+    if sess_raw is not None:
+        try: interval_id = int(sess_raw)
+        except Exception: interval_id = None
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
@@ -286,7 +335,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     def f(k): return _normf(feats.get(k))
 
     args = [
-        user_id,  # BIGINT o NULL
+        user_id, interval_id,
         received_at, start_time, end_time, sample_count, sample_rate,
         activity, json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
@@ -323,9 +372,9 @@ async def handle_connection(websocket):
                 await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
                 continue
 
-            # RPC de auth con manejo de errores robusto
-            if isinstance(data, dict) and "type" in data:
-                typ = data.get("type")
+            # RPC de auth/sesiones
+            if isinstance(data, dict) and "type" in data and isinstance(data["type"], str):
+                typ = data["type"]
                 try:
                     async with POOL.acquire() as conn:
                         if typ == "register":
@@ -336,43 +385,48 @@ async def handle_connection(websocket):
                                 (data.get("birthday") or "").strip() or None,
                                 data.get("password") or ""
                             )
-                            await websocket.send(json.dumps(resp))
-                            continue
+                            await websocket.send(json.dumps(resp)); continue
+
                         elif typ == "login":
                             resp = await login_user(
                                 conn,
                                 (data.get("email") or "").strip(),
                                 data.get("password") or ""
                             )
-                            await websocket.send(json.dumps(resp))
-                            continue
+                            await websocket.send(json.dumps(resp)); continue
+
                         elif typ == "change_password":
-                            uid_raw = data.get("id_usuario")
-                            try:
-                                uid = int(uid_raw)
+                            try: uid = int(data.get("id_usuario"))
                             except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"}))
-                                continue
-                            resp = await change_password(
-                                conn,
-                                uid,
-                                data.get("old_password") or "",
-                                data.get("new_password") or ""
-                            )
-                            await websocket.send(json.dumps(resp))
-                            continue
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
+                            resp = await change_password(conn, uid, data.get("old_password") or "", data.get("new_password") or "")
+                            await websocket.send(json.dumps(resp)); continue
+
+                        elif typ == "start_session":
+                            try: uid = int(data.get("id_usuario"))
+                            except Exception:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
+                            label = (data.get("label") or "").strip()
+                            reason = (data.get("reason") or "").strip()
+                            resp = await start_session(conn, uid, label, reason)
+                            await websocket.send(json.dumps(resp)); continue
+
+                        elif typ == "stop_session":
+                            try: iid = int(data.get("interval_id"))
+                            except Exception:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
+                            resp = await stop_session(conn, iid)
+                            await websocket.send(json.dumps(resp)); continue
+
                         elif typ == "ping":
-                            await websocket.send(json.dumps({"ok": True, "type": "pong"}))
-                            continue
+                            await websocket.send(json.dumps({"ok": True, "type": "pong"})); continue
+
                         else:
-                            await websocket.send(json.dumps({"ok": False, "code": "unknown_type", "message": "Tipo de RPC desconocido"}))
-                            continue
+                            await websocket.send(json.dumps({"ok": False, "code": "unknown_type", "message": "Tipo de RPC desconocido"})); continue
                 except Exception as e:
                     print(f"💥 Error en RPC {typ}: {e}")
-                    try:
-                        await websocket.send(json.dumps({"ok": False, "code": "server_error", "message": str(e)}))
-                    except Exception:
-                        pass
+                    try: await websocket.send(json.dumps({"ok": False, "code": "server_error", "message": str(e)}))
+                    except Exception: pass
                     continue
 
             # Ventanas
@@ -383,7 +437,7 @@ async def handle_connection(websocket):
                     try:
                         win_id = await save_window(item)
                         print("\n📦 Ventana recibida (DB):")
-                        print(f"  👤 id_usuario={item.get('id_usuario')}")
+                        print(f"  👤 id_usuario={item.get('id_usuario')}  🧩 session_id={item.get('session_id')}")
                         print(f"  ⏱  {item.get('start_time')} → {item.get('end_time')}")
                         print(f"  🔢  muestras={item.get('sample_count')} fs={item.get('sample_rate_hz')}")
                         print(f"  🏷  activity={item.get('activity')}")
