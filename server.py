@@ -3,7 +3,6 @@ import os
 import re
 import json
 import math
-import uuid
 import asyncio
 import asyncpg
 import websockets
@@ -18,7 +17,6 @@ POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
 
 # ---------- SQL ----------
-# Tabla de usuarios con id incremental (BIGSERIAL)
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
   id_usuario    BIGSERIAL PRIMARY KEY,
@@ -31,12 +29,10 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
-# Tabla de ventanas (id_usuario guardado como TEXT para compatibilidad)
-# Si quieres FK real a futuro: convertir windows.id_usuario -> BIGINT y agregar REFERENCES users(id_usuario)
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
-  id_usuario       TEXT, -- guardamos el id incremental como texto (p.ej. "3"), compatible con datos previos
+  id_usuario       TEXT,
   received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   start_time       TIMESTAMPTZ NOT NULL,
   end_time         TIMESTAMPTZ NOT NULL,
@@ -60,7 +56,7 @@ CREATE TABLE IF NOT EXISTS windows (
   gz_mean          DOUBLE PRECISION, gz_std DOUBLE PRECISION, gz_min DOUBLE PRECISION, gz_max DOUBLE PRECISION, gz_range DOUBLE PRECISION,
 
   pitch_mean       DOUBLE PRECISION, pitch_std DOUBLE PRECISION, pitch_min DOUBLE PRECISION, pitch_max DOUBLE PRECISION, pitch_range DOUBLE PRECISION,
-  roll_mean        DOUBLE PRECISION, roll_std DOUBLE PRECISION, roll_min DOUBLE PRECISION, roll_max DOUBLE PRECISION, roll_range DOUBLE PRECISION,
+  roll_mean        DOUBLE PRECISION, roll_std DOUBLE PRECISION, roll_min DOUBLE PRECERSION, roll_max DOUBLE PRECISION, roll_range DOUBLE PRECISION,
 
   acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION
 );
@@ -71,16 +67,13 @@ CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
 CREATE INDEX IF NOT EXISTS idx_windows_id_usuario  ON windows (id_usuario);
 """
 
-# Migraciones defensivas (no destructivas)
 MIGRATE_SQL = """
--- Asegura columnas en users
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
   ADD COLUMN IF NOT EXISTS birthday      DATE,
   ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
--- Crea índice sobre email solo si la columna existe
 DO $$
 BEGIN
   IF EXISTS (
@@ -91,11 +84,8 @@ BEGIN
   END IF;
 END $$;
 
--- Asegura columna id_usuario (como TEXT) en windows
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS id_usuario TEXT;
-
--- Asegura índices básicos ya definidos en CREATE_WINDOWS_SQL (idempotentes)
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash FROM users WHERE email = $1"
@@ -161,6 +151,7 @@ def _parse_ts(value):
     if isinstance(value, str):
         s = value.strip()
         if s.endswith('Z'): s = s[:-1] + '+00:00'
+        dt = None
         try:
             dt = datetime.fromisoformat(s)
         except ValueError:
@@ -173,8 +164,7 @@ def _parse_ts(value):
                     if tail[i] in '+-': tz = tail[i:]; break
                 s2 = f"{head}.{frac}{tz}"
                 dt = datetime.fromisoformat(s2)
-            else:
-                raise
+        if dt is None: return None
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return value
 
@@ -200,6 +190,7 @@ def _normi(v):
 
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
+    print(f"📝 register_user: email={email}, name={display_name}, birthday={birthday_str}")
     if not _email_re.match(email or ""):
         return {"ok": False, "code": "bad_email", "message": "Correo inválido"}
     if not password or len(password) < 6:
@@ -211,15 +202,17 @@ async def register_user(conn: asyncpg.Connection, email: str, display_name: Opti
 
     pwd_hash = PH.hash(password)
     row = await conn.fetchrow(INSERT_USER_RETURNING_SQL, email, display_name, bday, pwd_hash)
+    print(f"✅ register_user OK id={row['id_usuario']}")
     return {
         "ok": True,
-        "id_usuario": row["id_usuario"],  # entero autoincremental
+        "id_usuario": row["id_usuario"],
         "email": row["email"],
         "display_name": row["display_name"],
         "birthday": birthday_str
     }
 
 async def login_user(conn: asyncpg.Connection, email: str, password: str):
+    print(f"🔐 login_user: email={email}")
     if not _email_re.match(email or ""):
         return {"ok": False, "code": "bad_email", "message": "Correo inválido"}
     row = await conn.fetchrow(GET_USER_BY_EMAIL_SQL, email)
@@ -230,9 +223,11 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
     except VerifyMismatchError:
         return {"ok": False, "code": "invalid_credentials", "message": "Credenciales inválidas"}
     await conn.execute("UPDATE users SET last_seen_at = NOW() WHERE id_usuario = $1", row["id_usuario"])
+    print(f"✅ login_user OK id={row['id_usuario']}")
     return {"ok": True, "id_usuario": row["id_usuario"], "email": email}
 
 async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
+    print(f"🛠 change_password: id={user_id}")
     if not new_pwd or len(new_pwd) < 6:
         return {"ok": False, "code": "weak_password", "message": "Contraseña muy corta (mínimo 6)"}
     row = await conn.fetchrow(GET_USER_BY_ID_SQL, user_id)
@@ -244,6 +239,7 @@ async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, 
         return {"ok": False, "code": "invalid_credentials", "message": "Contraseña actual incorrecta"}
     pwd_hash = PH.hash(new_pwd)
     await conn.execute(SET_PASSWORD_SQL, user_id, pwd_hash)
+    print("✅ change_password OK")
     return {"ok": True}
 
 # ---------- DB init ----------
@@ -264,9 +260,8 @@ async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    # La app debe enviar id_usuario (numérico) como string o int; lo guardamos como texto en windows
-    user_id_any = item.get("id_usuario")
-    user_id_text = str(user_id_any) if user_id_any is not None else "anon"
+    uid_raw = item.get("id_usuario")
+    user_id_text = str(uid_raw) if uid_raw is not None else "anon"
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
@@ -321,44 +316,58 @@ async def handle_connection(websocket):
                 await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
                 continue
 
-            # RPC de auth
+            # RPC de auth con manejo de errores robusto
             if isinstance(data, dict) and "type" in data:
                 typ = data.get("type")
-                async with POOL.acquire() as conn:
-                    if typ == "register":
-                        resp = await register_user(
-                            conn,
-                            (data.get("email") or "").strip(),
-                            (data.get("display_name") or "").strip() or None,
-                            (data.get("birthday") or "").strip() or None,
-                            data.get("password") or ""
-                        )
-                        await websocket.send(json.dumps(resp))
-                        continue
-                    elif typ == "login":
-                        resp = await login_user(
-                            conn,
-                            (data.get("email") or "").strip(),
-                            data.get("password") or ""
-                        )
-                        await websocket.send(json.dumps(resp))
-                        continue
-                    elif typ == "change_password":
-                        # aquí esperamos id_usuario numérico
-                        uid_raw = data.get("id_usuario")
-                        try:
-                            uid = int(uid_raw)
-                        except Exception:
-                            await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"}))
+                try:
+                    async with POOL.acquire() as conn:
+                        if typ == "register":
+                            resp = await register_user(
+                                conn,
+                                (data.get("email") or "").strip(),
+                                (data.get("display_name") or "").strip() or None,
+                                (data.get("birthday") or "").strip() or None,
+                                data.get("password") or ""
+                            )
+                            await websocket.send(json.dumps(resp))
                             continue
-                        resp = await change_password(
-                            conn,
-                            uid,
-                            data.get("old_password") or "",
-                            data.get("new_password") or ""
-                        )
-                        await websocket.send(json.dumps(resp))
-                        continue
+                        elif typ == "login":
+                            resp = await login_user(
+                                conn,
+                                (data.get("email") or "").strip(),
+                                data.get("password") or ""
+                            )
+                            await websocket.send(json.dumps(resp))
+                            continue
+                        elif typ == "change_password":
+                            uid_raw = data.get("id_usuario")
+                            try:
+                                uid = int(uid_raw)
+                            except Exception:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"}))
+                                continue
+                            resp = await change_password(
+                                conn,
+                                uid,
+                                data.get("old_password") or "",
+                                data.get("new_password") or ""
+                            )
+                            await websocket.send(json.dumps(resp))
+                            continue
+                        elif typ == "ping":
+                            await websocket.send(json.dumps({"ok": True, "type": "pong"}))
+                            continue
+                        else:
+                            await websocket.send(json.dumps({"ok": False, "code": "unknown_type", "message": "Tipo de RPC desconocido"}))
+                            continue
+                except Exception as e:
+                    # Captura cualquier error inesperado del RPC y responde
+                    print(f"💥 Error en RPC {typ}: {e}")
+                    try:
+                        await websocket.send(json.dumps({"ok": False, "code": "server_error", "message": str(e)}))
+                    except Exception:
+                        pass
+                    continue
 
             # Ventanas
             items = data if isinstance(data, list) else [data]
@@ -381,7 +390,11 @@ async def handle_connection(websocket):
                 else:
                     acks.append({"ok": True, "type": "unknown"})
 
-            await websocket.send(json.dumps(acks[0] if len(acks) == 1 else acks, ensure_ascii=False))
+            try:
+                await websocket.send(json.dumps(acks[0] if len(acks) == 1 else acks, ensure_ascii=False))
+            except Exception as e:
+                print(f"⚠️ Error enviando ACK: {e}")
+
     except websockets.ConnectionClosed:
         print(f"❌ Cliente desconectado: {peer}")
     except Exception as e:
