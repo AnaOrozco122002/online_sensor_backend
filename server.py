@@ -18,17 +18,17 @@ POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
 
 # ---------- SQL ----------
+# NOTA: aquí NO creamos índice sobre email para evitar fallos si la columna no existe aún.
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
   id_usuario    TEXT PRIMARY KEY,
-  email         TEXT UNIQUE NOT NULL,
+  email         TEXT UNIQUE,
   display_name  TEXT,
   birthday      DATE,
   password_hash TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_seen_at  TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
 """
 
 CREATE_WINDOWS_SQL = """
@@ -69,21 +69,26 @@ CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
 CREATE INDEX IF NOT EXISTS idx_windows_id_usuario  ON windows (id_usuario);
 """
 
+# Migraciones defensivas:
+# - asegura columnas en users
+# - crea índice de email SOLO si la columna existe
+# - asegura FK id_usuario en windows
 MIGRATE_SQL = """
--- migraciones defensivas
-DO $$ BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name='users' AND column_name='email'
-    ) THEN
-      ALTER TABLE users ADD COLUMN email TEXT UNIQUE;
-    END IF;
-END $$;
-
 ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
   ADD COLUMN IF NOT EXISTS birthday      DATE,
   ADD COLUMN IF NOT EXISTS password_hash TEXT;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='users' AND column_name='email'
+  ) THEN
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+  END IF;
+END $$;
 
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS id_usuario TEXT REFERENCES users(id_usuario);
@@ -178,7 +183,6 @@ def _parse_ts(value):
 def _parse_date(s: Optional[str]) -> Optional[date]:
     if not s: return None
     try:
-        # espera 'YYYY-MM-DD'
         return date.fromisoformat(s.strip())
     except Exception:
         return None
@@ -197,14 +201,14 @@ def _normi(v):
         return None
 
 # ---------- Auth helpers ----------
+PH = PasswordHasher()
+
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
-    # validaciones
     if not _email_re.match(email or ""):
         return {"ok": False, "code": "bad_email", "message": "Correo inválido"}
     if not password or len(password) < 6:
         return {"ok": False, "code": "weak_password", "message": "Contraseña muy corta (mínimo 6)"}
     bday = _parse_date(birthday_str)
-    # email existente
     row = await conn.fetchrow(GET_USER_BY_EMAIL_SQL, email)
     if row and row["password_hash"]:
         return {"ok": False, "code": "email_exists", "message": "El correo ya está registrado"}
@@ -224,7 +228,6 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
         PH.verify(row["password_hash"], password)
     except VerifyMismatchError:
         return {"ok": False, "code": "invalid_credentials", "message": "Credenciales inválidas"}
-    # marca last_seen
     await conn.execute("UPDATE users SET last_seen_at = NOW() WHERE id_usuario = $1", row["id_usuario"])
     return {"ok": True, "id_usuario": row["id_usuario"], "email": email}
 
@@ -300,89 +303,90 @@ async def save_window(item: Dict[str, Any]) -> int:
     ]
 
     async with POOL.acquire() as conn:
-        # marca/crea presencia básica del usuario (sin crear cuenta formal)
+        # Marca/crea presencia básica (si llega un id_usuario desconocido)
         await conn.fetchval(UPSERT_USER_SEEN_SQL, user_id, None, display_name)
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
     return win_id
 
 # ---------- WS ----------
 async def handle_connection(websocket):
-    peer = websocket.remote_address
-    print(f"✅ Cliente conectado: {peer}")
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError as e:
-                print(f"⚠️ JSON inválido: {e}")
-                await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
-                continue
+  peer = websocket.remote_address
+  print(f"✅ Cliente conectado: {peer}")
+  try:
+    async for message in websocket:
+      try:
+        data = json.loads(message)
+      except json.JSONDecodeError as e:
+        print(f"⚠️ JSON inválido: {e}")
+        await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
+        continue
 
-            # RPC: auth
-            if isinstance(data, dict) and "type" in data:
-                typ = data.get("type")
-                async with POOL.acquire() as conn:
-                    if typ == "register":
-                        resp = await register_user(
-                            conn,
-                            (data.get("email") or "").strip(),
-                            (data.get("display_name") or "").strip() or None,
-                            (data.get("birthday") or "").strip() or None,
-                            data.get("password") or ""
-                        )
-                        await websocket.send(json.dumps(resp))
-                        continue
-                    elif typ == "login":
-                        resp = await login_user(
-                            conn,
-                            (data.get("email") or "").strip(),
-                            data.get("password") or ""
-                        )
-                        await websocket.send(json.dumps(resp))
-                        continue
-                    elif typ == "change_password":
-                        resp = await change_password(
-                            conn,
-                            (data.get("id_usuario") or "").strip(),
-                            data.get("old_password") or "",
-                            data.get("new_password") or ""
-                        )
-                        await websocket.send(json.dumps(resp))
-                        continue
+      # RPC de auth
+      if isinstance(data, dict) and "type" in data:
+        typ = data.get("type")
+        async with POOL.acquire() as conn:
+          if typ == "register":
+            resp = await register_user(
+              conn,
+              (data.get("email") or "").strip(),
+              (data.get("display_name") or "").strip() or None,
+              (data.get("birthday") or "").strip() or None,
+              data.get("password") or ""
+            )
+            await websocket.send(json.dumps(resp))
+            continue
+          elif typ == "login":
+            resp = await login_user(
+              conn,
+              (data.get("email") or "").strip(),
+              data.get("password") or ""
+            )
+            await websocket.send(json.dumps(resp))
+            continue
+          elif typ == "change_password":
+            resp = await change_password(
+              conn,
+              (data.get("id_usuario") or "").strip(),
+              data.get("old_password") or "",
+              data.get("new_password") or ""
+            )
+            await websocket.send(json.dumps(resp))
+            continue
 
-            # Ventanas
-            items = data if isinstance(data, list) else [data]
-            acks = []
-            for item in items:
-                if is_window_payload(item):
-                    try:
-                        win_id = await save_window(item)
-                        print("\n📦 Ventana recibida (DB):")
-                        print(f"  👤 id_usuario={item.get('id_usuario')}")
-                        print(f"  ⏱  {item.get('start_time')} → {item.get('end_time')}")
-                        print(f"  🔢  muestras={item.get('sample_count')} fs={item.get('sample_rate_hz')}")
-                        print(f"  🏷  activity={item.get('activity')}")
-                        print(f"  🧮  features={len((item.get('features') or {}))}")
-                        print(f"  🆔  window_id={win_id}")
-                        acks.append({"ok": True, "type": "window", "id": win_id})
-                    except Exception as db_e:
-                        print(f"💥 Error guardando ventana: {db_e}")
-                        acks.append({"ok": False, "type": "window", "error": str(db_e)})
-                else:
-                    acks.append({"ok": True, "type": "unknown"})
+      # Ventanas
+      items = data if isinstance(data, list) else [data]
+      acks = []
+      for item in items:
+        if is_window_payload(item):
+          try:
+            win_id = await save_window(item)
+            print("\n📦 Ventana recibida (DB):")
+            print(f"  👤 id_usuario={item.get('id_usuario')}")
+            print(f"  ⏱  {item.get('start_time')} → {item.get('end_time')}")
+            print(f"  🔢  muestras={item.get('sample_count')} fs={item.get('sample_rate_hz')}")
+            print(f"  🏷  activity={item.get('activity')}")
+            print(f"  🧮  features={len((item.get('features') or {}))}")
+            print(f"  🆔  window_id={win_id}")
+            acks.append({"ok": True, "type": "window", "id": win_id})
+          except Exception as db_e:
+            print(f"💥 Error guardando ventana: {db_e}")
+            acks.append({"ok": False, "type": "window", "error": str(db_e)})
+        else:
+          acks.append({"ok": True, "type": "unknown"})
 
-            await websocket.send(json.dumps(acks[0] if len(acks) == 1 else acks, ensure_ascii=False))
-    except websockets.ConnectionClosed:
-        print(f"❌ Cliente desconectado: {peer}")
-    except Exception as e:
-        print(f"⚠️ Error en la conexión: {e}")
+      await websocket.send(json.dumps(acks[0] if len(acks) == 1 else acks, ensure_ascii=False))
+  except websockets.ConnectionClosed:
+    print(f"❌ Cliente desconectado: {peer}")
+  except Exception as e:
+    print(f"⚠️ Error en la conexión: {e}")
 
+# ---------- Main ----------
 async def main():
-    await init_db()
-    print(f"🌐 Iniciando WebSocket en 0.0.0.0:{PORT} ...")
-    async with websockets.serve(handle_connection, "0.0.0.0", PORT, ping_interval=30, ping_timeout=30):
-        print(f"🚀 WS server escuchando en puerto {PORT}")
-        await asyncio.Future()
+  await init_db()
+  print(f"🌐 Iniciando WebSocket en 0.0.0.0:{PORT} ...")
+  async with websockets.serve(handle_connection, "0.0.0.0", PORT, ping_interval=30, ping_timeout=30):
+    print(f"🚀 WS server escuchando en puerto {PORT}")
+    await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+  asyncio.run(main())
