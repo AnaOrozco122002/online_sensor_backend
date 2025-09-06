@@ -29,26 +29,25 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+# Creamos la tabla de intervalos de forma segura (sin FK aún, la añadimos en MIGRATE_SQL)
 CREATE_INTERVALS_SQL = """
 CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
   session_id  TEXT UNIQUE NOT NULL,
-  user_id     BIGINT REFERENCES users(id_usuario),
+  user_id     BIGINT,
   label       TEXT NOT NULL,
   reason      TEXT,
   start_ts    TIMESTAMPTZ NOT NULL,
   end_ts      TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_intervals_user ON intervalos_label (user_id);
-CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
 """
 
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
   id_usuario       BIGINT REFERENCES users(id_usuario),
-  session_id       BIGINT REFERENCES intervalos_label(id),  -- FK a intervalo
+  session_id       BIGINT REFERENCES intervalos_label(id),
   received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   start_time       TIMESTAMPTZ NOT NULL,
   end_time         TIMESTAMPTZ NOT NULL,
@@ -84,13 +83,16 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
+# Migración defensiva (idempotente): asegura columnas/índices y FK de intervalos/windows
 MIGRATE_SQL = """
+-- USERS: asegurar columnas básicas
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
   ADD COLUMN IF NOT EXISTS birthday      DATE,
   ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
+-- Índice sobre email si existe
 DO $$
 BEGIN
   IF EXISTS (
@@ -98,6 +100,58 @@ BEGIN
     WHERE table_name='users' AND column_name='email'
   ) THEN
     CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+  END IF;
+END $$;
+
+-- INTERVALOS_LABEL: asegurar columna user_id
+ALTER TABLE intervalos_label
+  ADD COLUMN IF NOT EXISTS user_id BIGINT;
+
+-- INTERVALOS_LABEL: asegurar FK a users(id_usuario) si no existe
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints tc
+    WHERE tc.table_name = 'intervalos_label'
+      AND tc.constraint_type = 'FOREIGN KEY'
+      AND tc.constraint_name = 'intervalos_label_user_id_fkey'
+  ) THEN
+    ALTER TABLE intervalos_label
+      ADD CONSTRAINT intervalos_label_user_id_fkey
+      FOREIGN KEY (user_id) REFERENCES users(id_usuario);
+  END IF;
+END $$;
+
+-- INTERVALOS_LABEL: índices seguros (solo crear si la columna existe)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='intervalos_label' AND column_name='user_id'
+  ) THEN
+    CREATE INDEX IF NOT EXISTS idx_intervals_user ON intervalos_label (user_id);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
+
+-- WINDOWS: asegurar columna session_id y su FK (por si la tabla existía sin ella)
+ALTER TABLE windows
+  ADD COLUMN IF NOT EXISTS session_id BIGINT;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints tc
+    WHERE tc.table_name = 'windows'
+      AND tc.constraint_type = 'FOREIGN KEY'
+      AND tc.constraint_name = 'windows_session_id_fkey'
+  ) THEN
+    ALTER TABLE windows
+      ADD CONSTRAINT windows_session_id_fkey
+      FOREIGN KEY (session_id) REFERENCES intervalos_label(id);
   END IF;
 END $$;
 """
