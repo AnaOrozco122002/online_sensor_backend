@@ -17,6 +17,7 @@ POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
 
 # ---------- SQL ----------
+# Esquema final esperado (ids numéricos autoincrementales y FK real)
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
   id_usuario    BIGSERIAL PRIMARY KEY,
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
-  id_usuario       TEXT,
+  id_usuario       BIGINT REFERENCES users(id_usuario),  -- FK real, permite NULL
   received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   start_time       TIMESTAMPTZ NOT NULL,
   end_time         TIMESTAMPTZ NOT NULL,
@@ -67,13 +68,16 @@ CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
 CREATE INDEX IF NOT EXISTS idx_windows_id_usuario  ON windows (id_usuario);
 """
 
+# Migración defensiva mínima (no cambia tipos; asume que ya corriste la migración grande si venías de TEXT)
 MIGRATE_SQL = """
+-- Asegura columnas en users
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
   ADD COLUMN IF NOT EXISTS birthday      DATE,
   ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
+-- Índice sobre email si existe la columna
 DO $$
 BEGIN
   IF EXISTS (
@@ -83,9 +87,6 @@ BEGIN
     CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
   END IF;
 END $$;
-
-ALTER TABLE windows
-  ADD COLUMN IF NOT EXISTS id_usuario TEXT;
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash FROM users WHERE email = $1"
@@ -205,7 +206,7 @@ async def register_user(conn: asyncpg.Connection, email: str, display_name: Opti
     print(f"✅ register_user OK id={row['id_usuario']}")
     return {
         "ok": True,
-        "id_usuario": row["id_usuario"],
+        "id_usuario": row["id_usuario"],  # entero autoincremental
         "email": row["email"],
         "display_name": row["display_name"],
         "birthday": birthday_str
@@ -260,8 +261,14 @@ async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
+    # Esperamos id_usuario como número (int) o string numérica; permitimos None (guardará NULL en windows)
     uid_raw = item.get("id_usuario")
-    user_id_text = str(uid_raw) if uid_raw is not None else "anon"
+    user_id: Optional[int] = None
+    if uid_raw is not None:
+        try:
+            user_id = int(uid_raw)
+        except Exception:
+            user_id = None  # si viene malformado, guardamos NULL para no romper FK
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
@@ -279,7 +286,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     def f(k): return _normf(feats.get(k))
 
     args = [
-        user_id_text,
+        user_id,  # BIGINT o NULL
         received_at, start_time, end_time, sample_count, sample_rate,
         activity, json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
@@ -361,7 +368,6 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps({"ok": False, "code": "unknown_type", "message": "Tipo de RPC desconocido"}))
                             continue
                 except Exception as e:
-                    # Captura cualquier error inesperado del RPC y responde
                     print(f"💥 Error en RPC {typ}: {e}")
                     try:
                         await websocket.send(json.dumps({"ok": False, "code": "server_error", "message": str(e)}))
