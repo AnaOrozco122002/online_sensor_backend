@@ -18,10 +18,10 @@ POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
 
 # ---------- SQL ----------
-# NOTA: aquí NO creamos índice sobre email para evitar fallos si la columna no existe aún.
+# Tabla de usuarios con id incremental (BIGSERIAL)
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-  id_usuario    TEXT PRIMARY KEY,
+  id_usuario    BIGSERIAL PRIMARY KEY,
   email         TEXT UNIQUE,
   display_name  TEXT,
   birthday      DATE,
@@ -31,10 +31,12 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+# Tabla de ventanas (id_usuario guardado como TEXT para compatibilidad)
+# Si quieres FK real a futuro: convertir windows.id_usuario -> BIGINT y agregar REFERENCES users(id_usuario)
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
-  id_usuario       TEXT REFERENCES users(id_usuario),
+  id_usuario       TEXT, -- guardamos el id incremental como texto (p.ej. "3"), compatible con datos previos
   received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   start_time       TIMESTAMPTZ NOT NULL,
   end_time         TIMESTAMPTZ NOT NULL,
@@ -69,17 +71,16 @@ CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
 CREATE INDEX IF NOT EXISTS idx_windows_id_usuario  ON windows (id_usuario);
 """
 
-# Migraciones defensivas:
-# - asegura columnas en users
-# - crea índice de email SOLO si la columna existe
-# - asegura FK id_usuario en windows
+# Migraciones defensivas (no destructivas)
 MIGRATE_SQL = """
+-- Asegura columnas en users
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
   ADD COLUMN IF NOT EXISTS birthday      DATE,
   ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
+-- Crea índice sobre email solo si la columna existe
 DO $$
 BEGIN
   IF EXISTS (
@@ -90,23 +91,20 @@ BEGIN
   END IF;
 END $$;
 
+-- Asegura columna id_usuario (como TEXT) en windows
 ALTER TABLE windows
-  ADD COLUMN IF NOT EXISTS id_usuario TEXT REFERENCES users(id_usuario);
-"""
+  ADD COLUMN IF NOT EXISTS id_usuario TEXT;
 
-UPSERT_USER_SEEN_SQL = """
-INSERT INTO users (id_usuario, email, display_name, last_seen_at)
-VALUES ($1, $2, $3, NOW())
-ON CONFLICT (id_usuario) DO UPDATE SET
-  display_name = COALESCE(users.display_name, EXCLUDED.display_name),
-  last_seen_at = EXCLUDED.last_seen_at
-RETURNING id_usuario;
+-- Asegura índices básicos ya definidos en CREATE_WINDOWS_SQL (idempotentes)
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash FROM users WHERE email = $1"
 GET_USER_BY_ID_SQL    = "SELECT id_usuario, email, password_hash FROM users WHERE id_usuario = $1"
-INSERT_USER_SQL       = "INSERT INTO users (id_usuario, email, display_name, birthday, password_hash, last_seen_at) VALUES ($1,$2,$3,$4,$5,NOW())"
-
+INSERT_USER_RETURNING_SQL = """
+INSERT INTO users (email, display_name, birthday, password_hash, last_seen_at)
+VALUES ($1, $2, $3, $4, NOW())
+RETURNING id_usuario, email, display_name, birthday
+"""
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
 WINDOWS_INSERT_SQL = """
@@ -201,8 +199,6 @@ def _normi(v):
         return None
 
 # ---------- Auth helpers ----------
-PH = PasswordHasher()
-
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
     if not _email_re.match(email or ""):
         return {"ok": False, "code": "bad_email", "message": "Correo inválido"}
@@ -213,10 +209,15 @@ async def register_user(conn: asyncpg.Connection, email: str, display_name: Opti
     if row and row["password_hash"]:
         return {"ok": False, "code": "email_exists", "message": "El correo ya está registrado"}
 
-    user_id = uuid.uuid4().hex
     pwd_hash = PH.hash(password)
-    await conn.execute(INSERT_USER_SQL, user_id, email, display_name, bday, pwd_hash)
-    return {"ok": True, "id_usuario": user_id, "email": email, "display_name": display_name, "birthday": birthday_str}
+    row = await conn.fetchrow(INSERT_USER_RETURNING_SQL, email, display_name, bday, pwd_hash)
+    return {
+        "ok": True,
+        "id_usuario": row["id_usuario"],  # entero autoincremental
+        "email": row["email"],
+        "display_name": row["display_name"],
+        "birthday": birthday_str
+    }
 
 async def login_user(conn: asyncpg.Connection, email: str, password: str):
     if not _email_re.match(email or ""):
@@ -231,7 +232,7 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
     await conn.execute("UPDATE users SET last_seen_at = NOW() WHERE id_usuario = $1", row["id_usuario"])
     return {"ok": True, "id_usuario": row["id_usuario"], "email": email}
 
-async def change_password(conn: asyncpg.Connection, user_id: str, old_pwd: str, new_pwd: str):
+async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
     if not new_pwd or len(new_pwd) < 6:
         return {"ok": False, "code": "weak_password", "message": "Contraseña muy corta (mínimo 6)"}
     row = await conn.fetchrow(GET_USER_BY_ID_SQL, user_id)
@@ -263,8 +264,9 @@ async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    user_id = item.get("id_usuario") or "anon"
-    display_name = item.get("display_name")
+    # La app debe enviar id_usuario (numérico) como string o int; lo guardamos como texto en windows
+    user_id_any = item.get("id_usuario")
+    user_id_text = str(user_id_any) if user_id_any is not None else "anon"
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
@@ -282,7 +284,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     def f(k): return _normf(feats.get(k))
 
     args = [
-        user_id,
+        user_id_text,
         received_at, start_time, end_time, sample_count, sample_rate,
         activity, json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
@@ -303,90 +305,95 @@ async def save_window(item: Dict[str, Any]) -> int:
     ]
 
     async with POOL.acquire() as conn:
-        # Marca/crea presencia básica (si llega un id_usuario desconocido)
-        await conn.fetchval(UPSERT_USER_SEEN_SQL, user_id, None, display_name)
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
     return win_id
 
 # ---------- WS ----------
 async def handle_connection(websocket):
-  peer = websocket.remote_address
-  print(f"✅ Cliente conectado: {peer}")
-  try:
-    async for message in websocket:
-      try:
-        data = json.loads(message)
-      except json.JSONDecodeError as e:
-        print(f"⚠️ JSON inválido: {e}")
-        await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
-        continue
+    peer = websocket.remote_address
+    print(f"✅ Cliente conectado: {peer}")
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError as e:
+                print(f"⚠️ JSON inválido: {e}")
+                await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
+                continue
 
-      # RPC de auth
-      if isinstance(data, dict) and "type" in data:
-        typ = data.get("type")
-        async with POOL.acquire() as conn:
-          if typ == "register":
-            resp = await register_user(
-              conn,
-              (data.get("email") or "").strip(),
-              (data.get("display_name") or "").strip() or None,
-              (data.get("birthday") or "").strip() or None,
-              data.get("password") or ""
-            )
-            await websocket.send(json.dumps(resp))
-            continue
-          elif typ == "login":
-            resp = await login_user(
-              conn,
-              (data.get("email") or "").strip(),
-              data.get("password") or ""
-            )
-            await websocket.send(json.dumps(resp))
-            continue
-          elif typ == "change_password":
-            resp = await change_password(
-              conn,
-              (data.get("id_usuario") or "").strip(),
-              data.get("old_password") or "",
-              data.get("new_password") or ""
-            )
-            await websocket.send(json.dumps(resp))
-            continue
+            # RPC de auth
+            if isinstance(data, dict) and "type" in data:
+                typ = data.get("type")
+                async with POOL.acquire() as conn:
+                    if typ == "register":
+                        resp = await register_user(
+                            conn,
+                            (data.get("email") or "").strip(),
+                            (data.get("display_name") or "").strip() or None,
+                            (data.get("birthday") or "").strip() or None,
+                            data.get("password") or ""
+                        )
+                        await websocket.send(json.dumps(resp))
+                        continue
+                    elif typ == "login":
+                        resp = await login_user(
+                            conn,
+                            (data.get("email") or "").strip(),
+                            data.get("password") or ""
+                        )
+                        await websocket.send(json.dumps(resp))
+                        continue
+                    elif typ == "change_password":
+                        # aquí esperamos id_usuario numérico
+                        uid_raw = data.get("id_usuario")
+                        try:
+                            uid = int(uid_raw)
+                        except Exception:
+                            await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"}))
+                            continue
+                        resp = await change_password(
+                            conn,
+                            uid,
+                            data.get("old_password") or "",
+                            data.get("new_password") or ""
+                        )
+                        await websocket.send(json.dumps(resp))
+                        continue
 
-      # Ventanas
-      items = data if isinstance(data, list) else [data]
-      acks = []
-      for item in items:
-        if is_window_payload(item):
-          try:
-            win_id = await save_window(item)
-            print("\n📦 Ventana recibida (DB):")
-            print(f"  👤 id_usuario={item.get('id_usuario')}")
-            print(f"  ⏱  {item.get('start_time')} → {item.get('end_time')}")
-            print(f"  🔢  muestras={item.get('sample_count')} fs={item.get('sample_rate_hz')}")
-            print(f"  🏷  activity={item.get('activity')}")
-            print(f"  🧮  features={len((item.get('features') or {}))}")
-            print(f"  🆔  window_id={win_id}")
-            acks.append({"ok": True, "type": "window", "id": win_id})
-          except Exception as db_e:
-            print(f"💥 Error guardando ventana: {db_e}")
-            acks.append({"ok": False, "type": "window", "error": str(db_e)})
-        else:
-          acks.append({"ok": True, "type": "unknown"})
+            # Ventanas
+            items = data if isinstance(data, list) else [data]
+            acks = []
+            for item in items:
+                if is_window_payload(item):
+                    try:
+                        win_id = await save_window(item)
+                        print("\n📦 Ventana recibida (DB):")
+                        print(f"  👤 id_usuario={item.get('id_usuario')}")
+                        print(f"  ⏱  {item.get('start_time')} → {item.get('end_time')}")
+                        print(f"  🔢  muestras={item.get('sample_count')} fs={item.get('sample_rate_hz')}")
+                        print(f"  🏷  activity={item.get('activity')}")
+                        print(f"  🧮  features={len((item.get('features') or {}))}")
+                        print(f"  🆔  window_id={win_id}")
+                        acks.append({"ok": True, "type": "window", "id": win_id})
+                    except Exception as db_e:
+                        print(f"💥 Error guardando ventana: {db_e}")
+                        acks.append({"ok": False, "type": "window", "error": str(db_e)})
+                else:
+                    acks.append({"ok": True, "type": "unknown"})
 
-      await websocket.send(json.dumps(acks[0] if len(acks) == 1 else acks, ensure_ascii=False))
-  except websockets.ConnectionClosed:
-    print(f"❌ Cliente desconectado: {peer}")
-  except Exception as e:
-    print(f"⚠️ Error en la conexión: {e}")
+            await websocket.send(json.dumps(acks[0] if len(acks) == 1 else acks, ensure_ascii=False))
+    except websockets.ConnectionClosed:
+        print(f"❌ Cliente desconectado: {peer}")
+    except Exception as e:
+        print(f"⚠️ Error en la conexión: {e}")
 
 # ---------- Main ----------
 async def main():
-  await init_db()
-  print(f"🌐 Iniciando WebSocket en 0.0.0.0:{PORT} ...")
-  async with websockets.serve(handle_connection, "0.0.0.0", PORT, ping_interval=30, ping_timeout=30):
-    print(f"🚀 WS server escuchando en puerto {PORT}")
-    await asyncio.Future()
+    await init_db()
+    print(f"🌐 Iniciando WebSocket en 0.0.0.0:{PORT} ...")
+    async with websockets.serve(handle_connection, "0.0.0.0", PORT, ping_interval=30, ping_timeout=30):
+        print(f"🚀 WS server escuchando en puerto {PORT}")
+        await asyncio.Future()
 
 if __name__ == "__main__":
-  asyncio.run(main())
+    asyncio.run(main())
