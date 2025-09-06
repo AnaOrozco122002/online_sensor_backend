@@ -189,7 +189,7 @@ BEGIN
 END $$;
 """
 
-GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash FROM users WHERE email = $1"
+GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
 GET_USER_BY_ID_SQL    = "SELECT id_usuario, email, password_hash FROM users WHERE id_usuario = $1"
 INSERT_USER_RETURNING_SQL = """
 INSERT INTO users (email, display_name, birthday, password_hash, last_seen_at)
@@ -339,7 +339,12 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
         return {"ok": False, "code": "invalid_credentials", "message": "Credenciales inválidas"}
     await conn.execute("UPDATE users SET last_seen_at = NOW() WHERE id_usuario = $1", row["id_usuario"])
     print(f"✅ login_user OK id={row['id_usuario']}")
-    return {"ok": True, "id_usuario": row["id_usuario"], "email": email}
+    return {
+        "ok": True,
+        "id_usuario": row["id_usuario"],
+        "email": email,
+        "display_name": row["display_name"]  # ← agregado
+    }
 
 async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
     print(f"🛠 change_password: id={user_id}")
