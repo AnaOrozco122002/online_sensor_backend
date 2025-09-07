@@ -6,7 +6,7 @@ import math
 import asyncio
 import asyncpg
 import websockets
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -82,12 +82,9 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA:
-# - users: columnas e índice
-# - intervalos_label: user_id + FK + end_ts nullable
-# - windows.session_id: si NO es BIGINT, migrarlo a BIGINT y agregar FK a intervalos_label(id)
+# MIGRACIÓN DEFENSIVA
 MIGRATE_SQL = """
--- USERS: asegurar columnas básicas e índice por email
+-- USERS: asegurar columnas básicas
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
@@ -119,7 +116,7 @@ BEGIN
   ) THEN
     ALTER TABLE intervalos_label
       ADD CONSTRAINT intervalos_label_user_id_fkey
-      FOREIGN KEY (user_id) REFERENCES users(id_usuario) ON DELETE CASCADE;
+      FOREIGN KEY (user_id) REFERENCES users(id_usuario);
   END IF;
 END $$;
 
@@ -135,24 +132,7 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
 
--- Asegurar que end_ts permita NULL (por si quedó NOT NULL en alguna versión)
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name='intervalos_label' AND column_name='end_ts'
-  ) THEN
-    -- Si estaba NOT NULL, soltar la restricción
-    BEGIN
-      ALTER TABLE intervalos_label ALTER COLUMN end_ts DROP NOT NULL;
-    EXCEPTION WHEN others THEN
-      -- ignorar si ya es nullable o si no aplica
-      NULL;
-    END;
-  END IF;
-END $$;
-
--- WINDOWS: si session_id NO es BIGINT, migrarlo
+-- WINDOWS: asegurar session_id BIGINT
 DO $$
 DECLARE
   _data_type TEXT;
@@ -162,20 +142,16 @@ BEGIN
   WHERE table_name='windows' AND column_name='session_id';
 
   IF _data_type IS NULL THEN
-    -- no existe la columna, crearla correctamente
     ALTER TABLE windows ADD COLUMN session_id BIGINT;
   ELSIF _data_type <> 'bigint' THEN
-    -- crear columna temporal BIGINT
     ALTER TABLE windows ADD COLUMN IF NOT EXISTS session_id_new BIGINT;
 
-    -- Caso 1: session_id numérico en texto -> castear
     UPDATE windows
     SET session_id_new = NULLIF(session_id::text, '')::bigint
     WHERE session_id IS NOT NULL
       AND session_id::text ~ '^[0-9]+$'
       AND session_id_new IS NULL;
 
-    -- Caso 2: session_id slug -> mapear con intervalos_label.session_id
     UPDATE windows w
     SET session_id_new = i.id
     FROM intervalos_label i
@@ -183,13 +159,11 @@ BEGIN
       AND w.session_id IS NOT NULL
       AND w.session_id::text = i.session_id;
 
-    -- Reemplazar columna
     ALTER TABLE windows DROP COLUMN session_id;
     ALTER TABLE windows RENAME COLUMN session_id_new TO session_id;
   END IF;
 END $$;
 
--- WINDOWS: asegurar FK a intervalos_label(id)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -201,7 +175,7 @@ BEGIN
   ) THEN
     ALTER TABLE windows
       ADD CONSTRAINT windows_session_id_fkey
-      FOREIGN KEY (session_id) REFERENCES intervalos_label(id) ON DELETE SET NULL;
+      FOREIGN KEY (session_id) REFERENCES intervalos_label(id);
   END IF;
 END $$;
 """
@@ -270,12 +244,25 @@ def is_window_payload(d: Dict[str, Any]) -> bool:
     return isinstance(d, dict) and "features" in d and "start_time" in d and "end_time" in d
 
 def _parse_ts(value):
-    if value is None: return None
+    """
+    Convierte cadenas ISO8601 a UTC.
+    - Si la cadena tiene zona horaria (Z, +hh:mm), la respeta y convierte a UTC.
+    - Si la cadena NO tiene zona horaria, se asume HORA COLOMBIA (UTC-5) y se convierte a UTC.
+    """
+    if value is None:
+        return None
+
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None:
+            # naive → Colombia (UTC-5) → UTC
+            dt_utc = value + timedelta(hours=5)
+            return dt_utc.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     if isinstance(value, str):
         s = value.strip()
-        if s.endswith('Z'): s = s[:-1] + '+00:00'
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
         dt = None
         try:
             dt = datetime.fromisoformat(s)
@@ -286,11 +273,22 @@ def _parse_ts(value):
                 frac = (frac + '000000')[:6]
                 tz = ''
                 for i in range(len(tail)-1, -1, -1):
-                    if tail[i] in '+-': tz = tail[i:]; break
+                    if tail[i] in '+-':
+                        tz = tail[i:]
+                        break
                 s2 = f"{head}.{frac}{tz}"
-                dt = datetime.fromisoformat(s2)
-        if dt is None: return None
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                try:
+                    dt = datetime.fromisoformat(s2)
+                except Exception:
+                    dt = None
+        if dt is None:
+            return None
+
+        if dt.tzinfo is None:
+            dt_utc = dt + timedelta(hours=5)
+            return dt_utc.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     return value
 
 def _parse_date(s: Optional[str]) -> Optional[date]:
@@ -385,17 +383,8 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         return {"ok": False, "code": "bad_label", "message": "Label requerido"}
     session_id_txt = _slugify_label(label)
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(
-        INSERT_INTERVAL_SQL,
-        session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now
-    )
-    return {
-        "ok": True,
-        "interval_id": row["id"],
-        "session_id": row["session_id"],
-        "label": row["label"],
-        "start_ts": row["start_ts"].isoformat()
-    }
+    row = await conn.fetchrow(INSERT_INTERVAL_SQL, session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now)
+    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "label": row["label"], "start_ts": row["start_ts"].isoformat()}
 
 async def stop_session(conn: asyncpg.Connection, interval_id: int):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -423,53 +412,12 @@ async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    # id_usuario y session_id tolerantes (string "1" -> int 1)
     def _as_int(v):
         try: return int(v)
         except Exception: return None
 
     user_id     = _as_int(item.get("id_usuario"))
     interval_id = _as_int(item.get("session_id"))
-
-    def _normf(v):
-        try:
-            x = float(v)
-            return x if math.isfinite(x) else None
-        except Exception:
-            return None
-
-    def _normi(v):
-        try:
-            return int(v)
-        except Exception:
-            return None
-
-    def _parse_ts(value):
-        if value is None: return None
-        if isinstance(value, datetime):
-            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        if isinstance(value, str):
-            s = value.strip()
-            if s.endswith('Z'): s = s[:-1] + '+00:00'
-            dt = None
-            try:
-                dt = datetime.fromisoformat(s)
-            except ValueError:
-                if '.' in s:
-                    head, tail = s.split('.', 1)
-                    frac = ''.join(ch for ch in tail if ch.isdigit())
-                    frac = (frac + '000000')[:6]
-                    tz = ''
-                    for i in range(len(tail)-1, -1, -1):
-                        if tail[i] in '+-': tz = tail[i:]; break
-                    s2 = f"{head}.{frac}{tz}"
-                    try:
-                        dt = datetime.fromisoformat(s2)
-                    except Exception:
-                        dt = None
-            if dt is None: return None
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        return value
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
@@ -576,7 +524,7 @@ async def handle_connection(websocket):
                     except Exception: pass
                     continue
 
-            # Ventanas (puede venir 1 o un array)
+            # Ventanas
             items = data if isinstance(data, list) else [data]
             acks = []
             for item in items:
