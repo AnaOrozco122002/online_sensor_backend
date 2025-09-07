@@ -84,10 +84,10 @@ CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 
 # MIGRACIÓN DEFENSIVA:
 # - users: columnas e índice
-# - intervalos_label: user_id + FK
-# - windows.session_id: si NO es BIGINT, migrarlo a BIGINT
+# - intervalos_label: user_id + FK + end_ts nullable
+# - windows.session_id: si NO es BIGINT, migrarlo a BIGINT y agregar FK a intervalos_label(id)
 MIGRATE_SQL = """
--- USERS: asegurar columnas básicas
+-- USERS: asegurar columnas básicas e índice por email
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
@@ -119,7 +119,7 @@ BEGIN
   ) THEN
     ALTER TABLE intervalos_label
       ADD CONSTRAINT intervalos_label_user_id_fkey
-      FOREIGN KEY (user_id) REFERENCES users(id_usuario);
+      FOREIGN KEY (user_id) REFERENCES users(id_usuario) ON DELETE CASCADE;
   END IF;
 END $$;
 
@@ -134,6 +134,23 @@ BEGIN
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
+
+-- Asegurar que end_ts permita NULL (por si quedó NOT NULL en alguna versión)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='intervalos_label' AND column_name='end_ts'
+  ) THEN
+    -- Si estaba NOT NULL, soltar la restricción
+    BEGIN
+      ALTER TABLE intervalos_label ALTER COLUMN end_ts DROP NOT NULL;
+    EXCEPTION WHEN others THEN
+      -- ignorar si ya es nullable o si no aplica
+      NULL;
+    END;
+  END IF;
+END $$;
 
 -- WINDOWS: si session_id NO es BIGINT, migrarlo
 DO $$
@@ -184,7 +201,7 @@ BEGIN
   ) THEN
     ALTER TABLE windows
       ADD CONSTRAINT windows_session_id_fkey
-      FOREIGN KEY (session_id) REFERENCES intervalos_label(id);
+      FOREIGN KEY (session_id) REFERENCES intervalos_label(id) ON DELETE SET NULL;
   END IF;
 END $$;
 """
@@ -343,7 +360,7 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
         "ok": True,
         "id_usuario": row["id_usuario"],
         "email": email,
-        "display_name": row["display_name"]  # ← agregado
+        "display_name": row["display_name"]
     }
 
 async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
@@ -368,8 +385,17 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         return {"ok": False, "code": "bad_label", "message": "Label requerido"}
     session_id_txt = _slugify_label(label)
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(INSERT_INTERVAL_SQL, session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now)
-    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "label": row["label"], "start_ts": row["start_ts"].isoformat()}
+    row = await conn.fetchrow(
+        INSERT_INTERVAL_SQL,
+        session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now
+    )
+    return {
+        "ok": True,
+        "interval_id": row["id"],
+        "session_id": row["session_id"],
+        "label": row["label"],
+        "start_ts": row["start_ts"].isoformat()
+    }
 
 async def stop_session(conn: asyncpg.Connection, interval_id: int):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -550,7 +576,7 @@ async def handle_connection(websocket):
                     except Exception: pass
                     continue
 
-            # Ventanas
+            # Ventanas (puede venir 1 o un array)
             items = data if isinstance(data, list) else [data]
             acks = []
             for item in items:
