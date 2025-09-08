@@ -29,16 +29,17 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+#-- -- En esta definición, session_id es SIEMPRE igual a id
 CREATE_INTERVALS_SQL = """
 CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
-  session_id  TEXT UNIQUE NOT NULL,
   user_id     BIGINT,
   label       TEXT NOT NULL,
   reason      TEXT,
   start_ts    TIMESTAMPTZ NOT NULL,
   end_ts      TIMESTAMPTZ,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  session_id  BIGINT GENERATED ALWAYS AS (id) STORED UNIQUE
 );
 """
 
@@ -82,9 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA
+# ---------- Migración defensiva ----------
 MIGRATE_SQL = """
--- USERS: asegurar columnas básicas
+-- USERS: asegurar columnas básicas e índice
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
@@ -101,7 +102,7 @@ BEGIN
   END IF;
 END $$;
 
--- INTERVALOS_LABEL: asegurar columna user_id y FK
+-- INTERVALOS_LABEL: asegurar user_id + FK
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS user_id BIGINT;
 
@@ -132,38 +133,65 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
 
--- WINDOWS: asegurar session_id BIGINT
+-- WINDOWS.session_id -> BIGINT si hiciera falta (y mapear si existía slug)
 DO $$
 DECLARE
   _data_type TEXT;
+  _has_old_session_col BOOLEAN;
 BEGIN
   SELECT data_type INTO _data_type
   FROM information_schema.columns
   WHERE table_name='windows' AND column_name='session_id';
 
+  SELECT EXISTS(
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='intervalos_label' AND column_name='session_id'
+  ) INTO _has_old_session_col;
+
   IF _data_type IS NULL THEN
     ALTER TABLE windows ADD COLUMN session_id BIGINT;
+
   ELSIF _data_type <> 'bigint' THEN
     ALTER TABLE windows ADD COLUMN IF NOT EXISTS session_id_new BIGINT;
 
+    -- Si el viejo windows.session_id era numérico en texto -> castear
     UPDATE windows
     SET session_id_new = NULLIF(session_id::text, '')::bigint
-    WHERE session_id IS NOT NULL
-      AND session_id::text ~ '^[0-9]+$'
-      AND session_id_new IS NULL;
+    WHERE session_id_new IS NULL
+      AND session_id IS NOT NULL
+      AND session_id::text ~ '^[0-9]+$';
 
-    UPDATE windows w
-    SET session_id_new = i.id
-    FROM intervalos_label i
-    WHERE w.session_id_new IS NULL
-      AND w.session_id IS NOT NULL
-      AND w.session_id::text = i.session_id;
+    -- Si había intervalos_label.session_id tipo slug y se pudiera mapear (se maneja abajo al recrear)
+    -- (lo dejamos por compat, pero al final vamos a regenerar la columna en intervalos_label)
 
     ALTER TABLE windows DROP COLUMN session_id;
     ALTER TABLE windows RENAME COLUMN session_id_new TO session_id;
   END IF;
 END $$;
 
+-- intervalos_label.session_id: queremos que sea BIGINT = id (columna generada)
+DO $$
+DECLARE
+  _exists BOOLEAN;
+BEGIN
+  SELECT EXISTS(
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='intervalos_label' AND column_name='session_id'
+  ) INTO _exists;
+
+  IF _exists THEN
+    -- Si existía (sea TEXT o BIGINT normal), la eliminamos para recrearla bien
+    ALTER TABLE intervalos_label DROP COLUMN session_id;
+  END IF;
+
+  -- Crear como columna generada desde id
+  ALTER TABLE intervalos_label
+    ADD COLUMN session_id BIGINT GENERATED ALWAYS AS (id) STORED;
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_intervals_session_id ON intervalos_label (session_id);
+END $$;
+
+-- WINDOWS: asegurar FK a intervalos_label(id)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -189,9 +217,10 @@ RETURNING id_usuario, email, display_name, birthday
 """
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
+# Ya NO se inserta session_id (slug); se genera automáticamente a partir de id.
 INSERT_INTERVAL_SQL = """
-INSERT INTO intervalos_label (session_id, user_id, label, reason, start_ts)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO intervalos_label (user_id, label, reason, start_ts)
+VALUES ($1, $2, $3, $4)
 RETURNING id, session_id, label, reason, start_ts
 """
 END_INTERVAL_SQL = "UPDATE intervalos_label SET end_ts = $2 WHERE id = $1 RETURNING id, end_ts"
@@ -245,18 +274,16 @@ def is_window_payload(d: Dict[str, Any]) -> bool:
 
 def _parse_ts(value):
     """
-    Convierte cadenas ISO8601 a UTC.
-    - Si la cadena tiene zona horaria (Z, +hh:mm), la respeta y convierte a UTC.
-    - Si la cadena NO tiene zona horaria, se asume HORA COLOMBIA (UTC-5) y se convierte a UTC.
+    Convierte cadenas/fechas a UTC.
+    - Si trae zona horaria → a UTC.
+    - Si es naive → se asume Colombia (UTC-5) y se convierte a UTC.
     """
     if value is None:
         return None
 
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            # naive → Colombia (UTC-5) → UTC
-            dt_utc = value + timedelta(hours=5)
-            return dt_utc.replace(tzinfo=timezone.utc)
+            return (value + timedelta(hours=5)).replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
     if isinstance(value, str):
@@ -283,10 +310,8 @@ def _parse_ts(value):
                     dt = None
         if dt is None:
             return None
-
         if dt.tzinfo is None:
-            dt_utc = dt + timedelta(hours=5)
-            return dt_utc.replace(tzinfo=timezone.utc)
+            return (dt + timedelta(hours=5)).replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
 
     return value
@@ -310,13 +335,6 @@ def _normi(v):
         return int(v)
     except Exception:
         return None
-
-def _slugify_label(label: str) -> str:
-    base = re.sub(r'[^a-zA-Z0-9]+', '-', label.strip()).strip('-').lower()
-    if not base:
-        base = "session"
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    return f"{base}-{ts}"
 
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
@@ -381,10 +399,16 @@ async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, 
 async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reason: Optional[str]):
     if not label or not label.strip():
         return {"ok": False, "code": "bad_label", "message": "Label requerido"}
-    session_id_txt = _slugify_label(label)
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(INSERT_INTERVAL_SQL, session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now)
-    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "label": row["label"], "start_ts": row["start_ts"].isoformat()}
+    row = await conn.fetchrow(INSERT_INTERVAL_SQL, user_id, label.strip(), (reason or "").strip() or None, now)
+    # session_id es igual a id (columna generada)
+    return {
+        "ok": True,
+        "interval_id": row["id"],
+        "session_id": row["session_id"],
+        "label": row["label"],
+        "start_ts": row["start_ts"].isoformat()
+    }
 
 async def stop_session(conn: asyncpg.Connection, interval_id: int):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
