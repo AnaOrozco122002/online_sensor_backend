@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE_INTERVALS_SQL = """
 CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
-  session_id  TEXT UNIQUE NOT NULL,
+  -- session_id = espejo de id (BIGINT)
+  session_id  BIGINT GENERATED ALWAYS AS (id) STORED,
   id_usuario  BIGINT,
   label       TEXT NOT NULL,
   reason      TEXT,
@@ -52,14 +53,19 @@ CREATE TABLE IF NOT EXISTS windows (
   end_time         TIMESTAMPTZ NOT NULL,
   sample_count     INT NOT NULL,
   sample_rate_hz   DOUBLE PRECISION NOT NULL,
-  activity         TEXT,
   features         JSONB,
   samples_json     JSONB,
 
   start_index      BIGINT,
   end_index        BIGINT,
   n_muestras       INT,
-  etiqueta         TEXT,
+  etiqueta         TEXT,                -- puede ser NULL
+
+  -- nuevas columnas para el modelo (app envía NULL)
+  pred_label       TEXT,
+  confianza        DOUBLE PRECISION,
+  precision        DOUBLE PRECISION,
+  actividad        TEXT,
 
   ax_mean          DOUBLE PRECISION, ax_std DOUBLE PRECISION, ax_min DOUBLE PRECISION, ax_max DOUBLE PRECISION, ax_range DOUBLE PRECISION,
   ay_mean          DOUBLE PRECISION, ay_std DOUBLE PRECISION, ay_min DOUBLE PRECISION, ay_max DOUBLE PRECISION, ay_range DOUBLE PRECISION,
@@ -70,15 +76,9 @@ CREATE TABLE IF NOT EXISTS windows (
   gz_mean          DOUBLE PRECISION, gz_std DOUBLE PRECISION, gz_min DOUBLE PRECISION, gz_max DOUBLE PRECISION, gz_range DOUBLE PRECISION,
 
   pitch_mean       DOUBLE PRECISION, pitch_std DOUBLE PRECISION, pitch_min DOUBLE PRECISION, pitch_max DOUBLE PRECISION, pitch_range DOUBLE PRECISION,
-  roll_mean        DOUBLE PRECISION, roll_std DOUBLE PRECISION, roll_min DOUBLE PRECISION, roll_max DOUBLE PRECISION, roll_range DOUBLE PRECISION,
+  roll_mean        DOUBLE PRECISION,  roll_std  DOUBLE PRECISION, roll_min  DOUBLE PRECISION,  roll_max  DOUBLE PRECISION,  roll_range  DOUBLE PRECISION,
 
-  acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION,
-
-  -- nuevas columnas para el modelo
-  pred_label       TEXT,
-  confianza        DOUBLE PRECISION,
-  precision        DOUBLE PRECISION,
-  actividad        TEXT
+  acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
@@ -88,7 +88,11 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA
+# MIGRACIÓN DEFENSIVA:
+# - users: columnas e índice
+# - intervalos_label: renombrar user_id -> id_usuario, asegurar session_id BIGINT generado, FK/índices
+# - windows: eliminar activity si existe, añadir pred_label/confianza/precision/actividad si faltan,
+#            asegurar session_id BIGINT y FK a intervalos_label(id)
 MIGRATE_SQL = """
 -- USERS: asegurar columnas básicas
 ALTER TABLE users
@@ -107,52 +111,75 @@ BEGIN
   END IF;
 END $$;
 
--- INTERVALOS_LABEL: renombrar usar_id/user_id -> id_usuario; asegurar FK e índice
+-- INTERVALOS_LABEL: renombrar user_id -> id_usuario si existiera
 DO $$
 BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name='intervalos_label' AND column_name='usar_id'
-  ) THEN
-    EXECUTE 'ALTER TABLE intervalos_label RENAME COLUMN usar_id TO id_usuario';
-  END IF;
-
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_name='intervalos_label' AND column_name='user_id'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='intervalos_label' AND column_name='id_usuario'
   ) THEN
-    EXECUTE 'ALTER TABLE intervalos_label RENAME COLUMN user_id TO id_usuario';
+    ALTER TABLE intervalos_label RENAME COLUMN user_id TO id_usuario;
   END IF;
 END $$;
 
+-- INTERVALOS_LABEL: crear id_usuario si no existe
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS id_usuario BIGINT;
 
--- eliminar posible FK vieja para recrearla con id_usuario
+-- INTERVALOS_LABEL: FK a users(id_usuario)
 DO $$
-DECLARE
-  fk_name TEXT;
 BEGIN
-  SELECT tc.constraint_name INTO fk_name
-  FROM information_schema.table_constraints tc
-  WHERE tc.table_name='intervalos_label'
-    AND tc.constraint_type='FOREIGN KEY'
-    AND tc.constraint_name LIKE 'intervalos_label_%_fkey'
-  LIMIT 1;
-
-  IF fk_name IS NOT NULL THEN
-    EXECUTE format('ALTER TABLE intervalos_label DROP CONSTRAINT %I', fk_name);
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints tc
+    WHERE tc.table_name = 'intervalos_label'
+      AND tc.constraint_type = 'FOREIGN KEY'
+      AND tc.constraint_name = 'intervalos_label_id_usuario_fkey'
+  ) THEN
+    BEGIN
+      ALTER TABLE intervalos_label
+        ADD CONSTRAINT intervalos_label_id_usuario_fkey
+        FOREIGN KEY (id_usuario) REFERENCES users(id_usuario);
+    EXCEPTION WHEN duplicate_object THEN
+      -- por si existe con otro nombre, ignore
+      NULL;
+    END;
   END IF;
 END $$;
 
-ALTER TABLE intervalos_label
-  ADD CONSTRAINT intervalos_label_id_usuario_fkey
-  FOREIGN KEY (id_usuario) REFERENCES users(id_usuario);
+-- INTERVALOS_LABEL: asegurar session_id como BIGINT generado, espejo de id
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='intervalos_label' AND column_name='session_id'
+  ) THEN
+    -- si existe pero NO es generated, lo recreamos
+    PERFORM 1 FROM information_schema.columns
+      WHERE table_name='intervalos_label'
+        AND column_name='session_id'
+        AND is_generated = 'ALWAYS';
+    IF NOT FOUND THEN
+      ALTER TABLE intervalos_label DROP COLUMN session_id;
+      ALTER TABLE intervalos_label
+        ADD COLUMN session_id BIGINT GENERATED ALWAYS AS (id) STORED;
+    END IF;
+  ELSE
+    ALTER TABLE intervalos_label
+      ADD COLUMN session_id BIGINT GENERATED ALWAYS AS (id) STORED;
+  END IF;
+END $$;
 
-CREATE INDEX IF NOT EXISTS idx_intervals_user    ON intervalos_label (id_usuario);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_intervalos_label_session_id
+  ON intervalos_label (session_id);
+
 CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intervals_user    ON intervalos_label (id_usuario);
 
--- WINDOWS: asegurar session_id BIGINT (mapear si fuera texto con slug)
+-- WINDOWS: asegurar que session_id es BIGINT (y no texto) y que referencia a intervalos_label(id)
 DO $$
 DECLARE
   _data_type TEXT;
@@ -166,18 +193,20 @@ BEGIN
   ELSIF _data_type <> 'bigint' THEN
     ALTER TABLE windows ADD COLUMN IF NOT EXISTS session_id_new BIGINT;
 
+    -- Caso 1: numérico en texto -> castear
     UPDATE windows
-    SET session_id_new = NULLIF(session_id::text, '')::bigint
-    WHERE session_id IS NOT NULL
-      AND session_id::text ~ '^[0-9]+$'
-      AND session_id_new IS NULL;
+       SET session_id_new = NULLIF(session_id::text, '')::bigint
+     WHERE session_id IS NOT NULL
+       AND session_id::text ~ '^[0-9]+$'
+       AND session_id_new IS NULL;
 
+    -- Caso 2: session_id era slug -> mapear contra intervalos_label (si en algún momento existió)
     UPDATE windows w
-    SET session_id_new = i.id
-    FROM intervalos_label i
-    WHERE w.session_id_new IS NULL
-      AND w.session_id IS NOT NULL
-      AND w.session_id::text = i.session_id;
+       SET session_id_new = i.id
+      FROM intervalos_label i
+     WHERE w.session_id_new IS NULL
+       AND w.session_id IS NOT NULL
+       AND w.session_id::text = i.session_id::text;
 
     ALTER TABLE windows DROP COLUMN session_id;
     ALTER TABLE windows RENAME COLUMN session_id_new TO session_id;
@@ -199,11 +228,34 @@ BEGIN
   END IF;
 END $$;
 
--- WINDOWS: agregar columnas del modelo si faltan
-ALTER TABLE windows ADD COLUMN IF NOT EXISTS pred_label TEXT;
-ALTER TABLE windows ADD COLUMN IF NOT EXISTS confianza DOUBLE PRECISION;
-ALTER TABLE windows ADD COLUMN IF NOT EXISTS precision DOUBLE PRECISION;
-ALTER TABLE windows ADD COLUMN IF NOT EXISTS actividad TEXT;
+-- WINDOWS: eliminar columna activity si existe
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='windows' AND column_name='activity'
+  ) THEN
+    ALTER TABLE windows DROP COLUMN activity;
+  END IF;
+END $$;
+
+-- WINDOWS: añadir nuevas columnas del modelo si no existen
+ALTER TABLE windows
+  ADD COLUMN IF NOT EXISTS pred_label TEXT,
+  ADD COLUMN IF NOT EXISTS confianza DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS precision DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS actividad TEXT;
+
+-- Nota: etiqueta ya permite NULL por defecto; si alguna DB antigua la tenía NOT NULL, aflojar restricción
+DO $$
+BEGIN
+  -- No hay API simple para comprobar NOT NULL en information_schema sin inspección adicional.
+  -- Intento de aflojar en caliente:
+  EXECUTE 'ALTER TABLE windows ALTER COLUMN etiqueta DROP NOT NULL';
+EXCEPTION WHEN others THEN
+  -- Si ya estaba en NULLABLE no pasa nada.
+  NULL;
+END $$;
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
@@ -215,9 +267,10 @@ RETURNING id_usuario, email, display_name, birthday
 """
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
+# INSERT de intervalos SIN session_id (es generado)
 INSERT_INTERVAL_SQL = """
-INSERT INTO intervalos_label (session_id, id_usuario, label, reason, start_ts)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO intervalos_label (id_usuario, label, reason, start_ts)
+VALUES ($1, $2, $3, $4)
 RETURNING id, session_id, label, reason, start_ts
 """
 END_INTERVAL_SQL = "UPDATE intervalos_label SET end_ts = $2 WHERE id = $1 RETURNING id, end_ts"
@@ -226,8 +279,9 @@ WINDOWS_INSERT_SQL = """
 INSERT INTO windows (
   id_usuario, session_id,
   received_at, start_time, end_time, sample_count, sample_rate_hz,
-  activity, features, samples_json,
+  features, samples_json,
   start_index, end_index, n_muestras, etiqueta,
+  pred_label, confianza, precision, actividad,
 
   ax_mean, ax_std, ax_min, ax_max, ax_range,
   ay_mean, ay_std, ay_min, ay_max, ay_range,
@@ -240,29 +294,26 @@ INSERT INTO windows (
   pitch_mean, pitch_std, pitch_min, pitch_max, pitch_range,
   roll_mean,  roll_std,  roll_min,  roll_max,  roll_range,
 
-  acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range,
-
-  pred_label, confianza, precision, actividad
+  acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range
 ) VALUES (
   $1, $2,
   $3, $4, $5, $6, $7,
-  $8, $9::jsonb, $10::jsonb,
-  $11, $12, $13, $14,
+  $8::jsonb, $9::jsonb,
+  $10, $11, $12, $13,
+  $14, $15, $16, $17,
 
-  $15, $16, $17, $18, $19,
-  $20, $21, $22, $23, $24,
-  $25, $26, $27, $28, $29,
+  $18, $19, $20, $21, $22,
+  $23, $24, $25, $26, $27,
+  $28, $29, $30, $31, $32,
 
-  $30, $31, $32, $33, $34,
-  $35, $36, $37, $38, $39,
-  $40, $41, $42, $43, $44,
+  $33, $34, $35, $36, $37,
+  $38, $39, $40, $41, $42,
+  $43, $44, $45, $46, $47,
 
-  $45, $46, $47, $48, $49,
-  $50, $51, $52, $53, $54,
+  $48, $49, $50, $51, $52,
+  $53, $54, $55, $56, $57,
 
-  $55, $56, $57, $58, $59,
-
-  $60, $61, $62, $63
+  $58, $59, $60, $61, $62
 )
 RETURNING id;
 """
@@ -275,16 +326,16 @@ def is_window_payload(d: Dict[str, Any]) -> bool:
 
 def _parse_ts(value):
     """
-    Convierte cadenas ISO8601 a UTC.
-    - Si la cadena tiene zona horaria (Z, +hh:mm), la respeta y convierte a UTC.
-    - Si la cadena NO tiene zona horaria, se asume HORA COLOMBIA (UTC-5) y se convierte a UTC.
+    Convierte a UTC.
+    - Si llega con zona (Z, +hh:mm) → convierte a UTC.
+    - Si llega sin zona → asume Colombia (UTC-5) y convierte a UTC.
     """
     if value is None:
         return None
 
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            dt_utc = value + timedelta(hours=5)  # Colombia -> UTC
+            dt_utc = value + timedelta(hours=5)
             return dt_utc.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
@@ -314,7 +365,7 @@ def _parse_ts(value):
             return None
 
         if dt.tzinfo is None:
-            dt_utc = dt + timedelta(hours=5)  # Colombia -> UTC
+            dt_utc = dt + timedelta(hours=5)
             return dt_utc.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
 
@@ -339,13 +390,6 @@ def _normi(v):
         return int(v)
     except Exception:
         return None
-
-def _slugify_label(label: str) -> str:
-    base = re.sub(r'[^a-zA-Z0-9]+', '-', label.strip()).strip('-').lower()
-    if not base:
-        base = "session"
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    return f"{base}-{ts}"
 
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
@@ -387,7 +431,7 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
         "ok": True,
         "id_usuario": row["id_usuario"],
         "email": email,
-        "display_name": row["display_name"]
+        "display_name": row.get("display_name")
     }
 
 async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
@@ -408,12 +452,25 @@ async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, 
 
 # ---------- Sessions RPC ----------
 async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reason: Optional[str]):
+    """
+    label = actividad seleccionada por el usuario al inicio
+    reason = si no llega, usamos 'initial'
+    """
     if not label or not label.strip():
         return {"ok": False, "code": "bad_label", "message": "Label requerido"}
-    session_id_txt = _slugify_label(label)
+
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(INSERT_INTERVAL_SQL, session_id_txt, user_id, label.strip(), (reason or "").strip() or None, now)
-    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "label": row["label"], "start_ts": row["start_ts"].isoformat()}
+    reason_val = (reason or "initial").strip()
+
+    # No insertamos session_id (es generado como espejo de id)
+    row = await conn.fetchrow(INSERT_INTERVAL_SQL, user_id, label.strip(), reason_val, now)
+    return {
+        "ok": True,
+        "interval_id": row["id"],
+        "session_id": row["session_id"],  # == id
+        "label": row["label"],
+        "start_ts": row["start_ts"].isoformat()
+    }
 
 async def stop_session(conn: asyncpg.Connection, interval_id: int):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -445,36 +502,31 @@ async def save_window(item: Dict[str, Any]) -> int:
         try: return int(v)
         except Exception: return None
 
-    user_id     = _as_int(item.get("id_usuario"))
-    interval_id = _as_int(item.get("session_id"))
+    id_usuario = _as_int(item.get("id_usuario"))
+    interval_id = _as_int(item.get("session_id"))  # la app manda el interval_id como session_id (OK)
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
     sample_count = _normi(item.get("sample_count"))
     sample_rate  = _normf(item.get("sample_rate_hz"))
-    activity     = item.get("activity")
     feats        = item.get("features") or {}
     samples      = item.get("samples")
 
     start_index  = _normi(feats.get("start_index"))
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
-    etiqueta     = feats.get("etiqueta") if feats.get("etiqueta") is not None else activity
+    etiqueta     = feats.get("etiqueta")  # puede venir NULL (modelo la actualizará)
 
     def f(k): return _normf(feats.get(k))
 
-    # columnas del modelo (si la app las manda, se guardan; si no, NULL)
-    pred_label = item.get("pred_label")
-    confianza  = _normf(item.get("confianza"))
-    precisionf = _normf(item.get("precision"))
-    actividad2 = item.get("actividad")  # puede ser null; distinto de "activity" que viene del cliente
-
     args = [
-        user_id, interval_id,
+        id_usuario, interval_id,
         received_at, start_time, end_time, sample_count, sample_rate,
-        activity, json.dumps(feats, ensure_ascii=False),
+        json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
         start_index, end_index, n_muestras, etiqueta,
+
+        None, None, None, None,  # pred_label, confianza, precision, actividad (las llena el modelo)
 
         f("ax_mean"), f("ax_std"), f("ax_min"), f("ax_max"), f("ax_range"),
         f("ay_mean"), f("ay_std"), f("ay_min"), f("ay_max"), f("ay_range"),
@@ -488,8 +540,6 @@ async def save_window(item: Dict[str, Any]) -> int:
         f("roll_mean"),  f("roll_std"),  f("roll_min"),  f("roll_max"),  f("roll_range"),
 
         f("acc_mag_mean"), f("acc_mag_std"), f("acc_mag_min"), f("acc_mag_max"), f("acc_mag_range"),
-
-        pred_label, confianza, precisionf, actividad2
     ]
 
     async with POOL.acquire() as conn:
@@ -538,8 +588,8 @@ async def handle_connection(websocket):
                             try: uid = int(data.get("id_usuario"))
                             except Exception:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
-                            label  = (data.get("label") or "").strip()
-                            reason = (data.get("reason") or "").strip()
+                            label  = (data.get("label") or "").strip()   # actividad elegida
+                            reason = (data.get("reason") or "").strip()  # si no, server pondrá "initial"
                             resp = await start_session(conn, uid, label, reason)
                             await websocket.send(json.dumps(resp)); continue
 
@@ -561,7 +611,7 @@ async def handle_connection(websocket):
                     except Exception: pass
                     continue
 
-            # Ventanas (lista o único objeto)
+            # Ventanas
             items = data if isinstance(data, list) else [data]
             acks = []
             for item in items:
@@ -569,10 +619,9 @@ async def handle_connection(websocket):
                     try:
                         win_id = await save_window(item)
                         print("\n📦 Ventana recibida (DB):")
-                        print(f"  👤 id_usuario={item.get('id_usuario')}  🧩 session_id={item.get('session_id')}")
+                        print(f"  👤 id_usuario={item.get('id_usuario')}  🧩 session_id(interval_id)={item.get('session_id')}")
                         print(f"  ⏱  {item.get('start_time')} → {item.get('end_time')}")
                         print(f"  🔢  muestras={item.get('sample_count')} fs={item.get('sample_rate_hz')}")
-                        print(f"  🏷  activity={item.get('activity')}")
                         print(f"  🧮  features={len((item.get('features') or {}))}")
                         print(f"  🆔  window_id={win_id}")
                         acks.append({"ok": True, "type": "window", "id": win_id})
