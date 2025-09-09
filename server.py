@@ -91,7 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA
+# MIGRACIÓN DEFENSIVA: normaliza session_id=id en intervalos_label y asegura FK de windows
 MIGRATE_SQL = """
 -- USERS: asegurar columnas básicas + índice en email
 ALTER TABLE users
@@ -110,10 +110,9 @@ BEGIN
   END IF;
 END $$;
 
--- INTERVALOS_LABEL: unificar nombres, tipos y fks
+-- INTERVALOS_LABEL: renombrar user_id -> id_usuario si existiera
 DO $$
 BEGIN
-  -- Renombrar user_id -> id_usuario si existiera
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_name='intervalos_label' AND column_name='user_id'
@@ -123,13 +122,13 @@ BEGIN
   END IF;
 END $$;
 
--- Asegurar columnas y tipos
+-- Asegurar columnas y tipos existentes (id_usuario, reason, duracion)
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS id_usuario BIGINT,
   ADD COLUMN IF NOT EXISTS reason     TEXT,
   ADD COLUMN IF NOT EXISTS duracion   INTEGER;
 
--- session_id debe ser BIGINT UNIQUE NOT NULL
+-- Asegura que session_id exista y sea BIGINT
 DO $$
 DECLARE
   _data_type TEXT;
@@ -153,26 +152,33 @@ BEGIN
     ALTER TABLE intervalos_label DROP COLUMN session_id;
     ALTER TABLE intervalos_label RENAME COLUMN session_id_new TO session_id;
   END IF;
-
-  -- Not null + unique
-  ALTER TABLE intervalos_label ALTER COLUMN session_id SET NOT NULL;
-
-  DO $inner$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1
-      FROM information_schema.table_constraints
-      WHERE table_name = 'intervalos_label'
-        AND constraint_type = 'UNIQUE'
-        AND constraint_name = 'intervalos_label_session_id_key'
-    ) THEN
-      ALTER TABLE intervalos_label
-        ADD CONSTRAINT intervalos_label_session_id_key UNIQUE (session_id);
-    END IF;
-  END
-  $inner$;
-
 END $$;
+
+-- Normaliza datos: session_id = id (esto elimina duplicados)
+UPDATE intervalos_label
+SET session_id = id
+WHERE session_id IS DISTINCT FROM id OR session_id IS NULL;
+
+-- Quita constraints/índices únicos previos conflicting y recrea el único correcto
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'intervalos_label_session_id_key'
+  ) THEN
+    ALTER TABLE intervalos_label DROP CONSTRAINT intervalos_label_session_id_key;
+  END IF;
+EXCEPTION WHEN undefined_table THEN NULL;
+END $$;
+
+DROP INDEX IF EXISTS intervalos_label_session_id_key;
+DROP INDEX IF EXISTS idx_intervalos_label_session_id;
+DROP INDEX IF EXISTS uq_intervalos_label_session_id;
+
+ALTER TABLE intervalos_label
+  ALTER COLUMN session_id SET NOT NULL;
+
+ALTER TABLE intervalos_label
+  ADD CONSTRAINT intervalos_label_session_id_key UNIQUE (session_id);
 
 -- FK a users (id_usuario)
 DO $$
@@ -190,7 +196,7 @@ BEGIN
   END IF;
 END $$;
 
--- WINDOWS: asegurar session_id BIGINT FK a intervalos_label(id)
+-- WINDOWS: asegurar session_id BIGINT y FK a intervalos_label(id)
 DO $$
 DECLARE
   _data_type TEXT;
@@ -225,20 +231,23 @@ END $$;
 
 DO $$
 BEGIN
-  IF NOT EXISTS (
+  IF EXISTS (
     SELECT 1
     FROM information_schema.table_constraints
     WHERE table_name = 'windows'
       AND constraint_type = 'FOREIGN KEY'
       AND constraint_name = 'windows_session_id_fkey'
   ) THEN
-    ALTER TABLE windows
-      ADD CONSTRAINT windows_session_id_fkey
-      FOREIGN KEY (session_id) REFERENCES intervalos_label(id);
+    ALTER TABLE windows DROP CONSTRAINT windows_session_id_fkey;
   END IF;
 END $$;
 
--- WINDOWS: columnas del modelo
+ALTER TABLE windows
+  ADD CONSTRAINT windows_session_id_fkey
+  FOREIGN KEY (session_id) REFERENCES intervalos_label(id)
+  ON DELETE SET NULL;
+
+-- WINDOWS: columnas del modelo por si faltaran
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS pred_label  TEXT,
   ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
@@ -255,11 +264,15 @@ RETURNING id_usuario, email, display_name, birthday
 """
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
-INSERT_INTERVAL_SQL = """
-INSERT INTO intervalos_label (session_id, id_usuario, label, reason, start_ts)
-VALUES ($1, $2, $3, $4, $5)
+# NUEVO: inserción de intervalo con id preasignado == session_id
+GET_NEXT_INTERVAL_ID_SQL = "SELECT nextval(pg_get_serial_sequence('intervalos_label','id')) AS new_id"
+
+INSERT_INTERVAL_WITH_ID_SQL = """
+INSERT INTO intervalos_label (id, session_id, id_usuario, label, reason, start_ts)
+VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
+
 END_INTERVAL_SQL = "UPDATE intervalos_label SET end_ts = $2 WHERE id = $1 RETURNING id, end_ts"
 
 # Nuevo: leer reason/label/duracion por id de intervalo
@@ -397,17 +410,6 @@ def _normi(v):
     except Exception:
         return None
 
-def _slugify_label(label: str) -> int:
-    """
-    Genera un session_id BIGINT pseudo-único (marca de tiempo + hash simple).
-    Como el campo session_id es BIGINT y único, devolvemos un entero.
-    """
-    ts = int(datetime.utcnow().timestamp() * 1000)
-    base = re.sub(r'[^a-zA-Z0-9]+', '-', label.strip()).strip('-').lower() or 'session'
-    h = abs(hash(base)) % 100000
-    # Estructura: yyyymmddHHMMSSmmm000 + hash pequeño (final)
-    return int(f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{ts % 1000:03d}{h:05d}")
-
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
     print(f"📝 register_user: email={email}, name={display_name}, birthday={birthday_str}")
@@ -469,12 +471,35 @@ async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, 
 
 # ---------- Sessions RPC ----------
 async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reason: Optional[str]):
+    """
+    Crea un intervalo donde id == session_id (único).
+    Evitamos insertar un session_id 'random'; usamos el siguiente valor de la secuencia
+    para asignarlo explícitamente a id y session_id en el INSERT.
+    """
     if not label or not label.strip():
         return {"ok": False, "code": "bad_label", "message": "Label requerido"}
-    session_numeric = _slugify_label(label)
+
+    # 1) obtener el próximo id de la secuencia de intervalos
+    new_id = await conn.fetchval(GET_NEXT_INTERVAL_ID_SQL)
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(INSERT_INTERVAL_SQL, session_numeric, user_id, label.strip(), (reason or "").strip() or None, now)
-    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "label": row["label"], "start_ts": row["start_ts"].isoformat()}
+
+    # 2) insertar usando ese id tanto para id como para session_id
+    row = await conn.fetchrow(
+        INSERT_INTERVAL_WITH_ID_SQL,
+        new_id,                # $1 -> id y session_id
+        user_id,               # $2
+        label.strip(),         # $3
+        (reason or "").strip() or None,  # $4
+        now                    # $5
+    )
+
+    return {
+        "ok": True,
+        "interval_id": row["id"],
+        "session_id": row["session_id"],
+        "label": row["label"],
+        "start_ts": row["start_ts"].isoformat()
+    }
 
 async def stop_session(conn: asyncpg.Connection, interval_id: int):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
