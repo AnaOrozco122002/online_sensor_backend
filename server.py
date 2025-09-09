@@ -55,7 +55,6 @@ CREATE TABLE IF NOT EXISTS windows (
   end_time         TIMESTAMPTZ NOT NULL,
   sample_count     INT NOT NULL,
   sample_rate_hz   DOUBLE PRECISION NOT NULL,
-  -- activity        TEXT,                                  -- eliminado por diseño
   features         JSONB,
   samples_json     JSONB,
 
@@ -93,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 
 # MIGRACIÓN DEFENSIVA: normaliza session_id=id en intervalos_label y asegura FK de windows
 MIGRATE_SQL = """
--- USERS: asegurar columnas básicas + índice en email
+-- USERS
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS email         TEXT,
   ADD COLUMN IF NOT EXISTS display_name  TEXT,
@@ -122,13 +121,13 @@ BEGIN
   END IF;
 END $$;
 
--- Asegurar columnas y tipos existentes (id_usuario, reason, duracion)
+-- Asegurar columnas y tipos (id_usuario, reason, duracion)
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS id_usuario BIGINT,
   ADD COLUMN IF NOT EXISTS reason     TEXT,
   ADD COLUMN IF NOT EXISTS duracion   INTEGER;
 
--- Asegura que session_id exista y sea BIGINT
+-- Asegura session_id BIGINT
 DO $$
 DECLARE
   _data_type TEXT;
@@ -142,7 +141,6 @@ BEGIN
   ELSIF _data_type <> 'bigint' THEN
     ALTER TABLE intervalos_label ADD COLUMN IF NOT EXISTS session_id_new BIGINT;
 
-    -- Intentar castear si era texto
     UPDATE intervalos_label
     SET session_id_new = NULLIF(session_id::text, '')::bigint
     WHERE session_id_new IS NULL
@@ -154,12 +152,12 @@ BEGIN
   END IF;
 END $$;
 
--- Normaliza datos: session_id = id (esto elimina duplicados)
+-- Normaliza datos: session_id = id
 UPDATE intervalos_label
 SET session_id = id
 WHERE session_id IS DISTINCT FROM id OR session_id IS NULL;
 
--- Quita constraints/índices únicos previos conflicting y recrea el único correcto
+-- Elimina constraints/índices únicos conflictivos y recrea el único correcto
 DO $$
 BEGIN
   IF EXISTS (
@@ -180,7 +178,7 @@ ALTER TABLE intervalos_label
 ALTER TABLE intervalos_label
   ADD CONSTRAINT intervalos_label_session_id_key UNIQUE (session_id);
 
--- FK a users (id_usuario)
+-- FK a users
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -216,7 +214,6 @@ BEGIN
       AND session_id::text ~ '^[0-9]+$'
       AND session_id_new IS NULL;
 
-    -- Relacionar por coincidencia textual si aplica
     UPDATE windows w
     SET session_id_new = i.id
     FROM intervalos_label i
@@ -264,7 +261,7 @@ RETURNING id_usuario, email, display_name, birthday
 """
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
-# NUEVO: inserción de intervalo con id preasignado == session_id
+# Inserción de intervalo con id preasignado == session_id
 GET_NEXT_INTERVAL_ID_SQL = "SELECT nextval(pg_get_serial_sequence('intervalos_label','id')) AS new_id"
 
 INSERT_INTERVAL_WITH_ID_SQL = """
@@ -275,21 +272,21 @@ RETURNING id, session_id, label, reason, start_ts
 
 END_INTERVAL_SQL = "UPDATE intervalos_label SET end_ts = $2 WHERE id = $1 RETURNING id, end_ts"
 
-# Nuevo: leer reason/label/duracion por id de intervalo
+# Leer reason/label/duracion por id de intervalo
 GET_INTERVAL_REASON_SQL = """
 SELECT id, reason, label, duracion
 FROM intervalos_label
 WHERE id = $1
 """
 
-# Nuevo: aplicar feedback (actualiza label/duracion y limpia reason)
+# Aplicar feedback: actualiza label/duracion y deja reason='ok'
 APPLY_INTERVAL_FEEDBACK_SQL = """
 UPDATE intervalos_label
 SET label = $2,
     duracion = $3,
-    reason = NULL
+    reason = 'ok'
 WHERE id = $1
-RETURNING id, label, duracion
+RETURNING id, label, duracion, reason
 """
 
 WINDOWS_INSERT_SQL = """
@@ -344,20 +341,13 @@ def is_window_payload(d: Dict[str, Any]) -> bool:
     return isinstance(d, dict) and "features" in d and "start_time" in d and "end_time" in d
 
 def _parse_ts(value):
-    """
-    Convierte cadenas ISO8601 a UTC.
-    - Si la cadena tiene zona horaria (Z, +hh:mm), la respeta y convierte a UTC.
-    - Si la cadena NO tiene zona horaria, se asume HORA COLOMBIA (UTC-5) y se convierte a UTC.
-    """
     if value is None:
         return None
-
     if isinstance(value, datetime):
         if value.tzinfo is None:
             dt_utc = value + timedelta(hours=5)
             return dt_utc.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
-
     if isinstance(value, str):
         s = value.strip()
         if s.endswith('Z'):
@@ -382,12 +372,10 @@ def _parse_ts(value):
                     dt = None
         if dt is None:
             return None
-
         if dt.tzinfo is None:
             dt_utc = dt + timedelta(hours=5)
             return dt_utc.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
-
     return value
 
 def _parse_date(s: Optional[str]) -> Optional[date]:
@@ -471,26 +459,19 @@ async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, 
 
 # ---------- Sessions RPC ----------
 async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reason: Optional[str]):
-    """
-    Crea un intervalo donde id == session_id (único).
-    Evitamos insertar un session_id 'random'; usamos el siguiente valor de la secuencia
-    para asignarlo explícitamente a id y session_id en el INSERT.
-    """
     if not label or not label.strip():
         return {"ok": False, "code": "bad_label", "message": "Label requerido"}
 
-    # 1) obtener el próximo id de la secuencia de intervalos
     new_id = await conn.fetchval(GET_NEXT_INTERVAL_ID_SQL)
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    # 2) insertar usando ese id tanto para id como para session_id
     row = await conn.fetchrow(
         INSERT_INTERVAL_WITH_ID_SQL,
-        new_id,                # $1 -> id y session_id
-        user_id,               # $2
-        label.strip(),         # $3
-        (reason or "").strip() or None,  # $4
-        now                    # $5
+        new_id,
+        user_id,
+        label.strip(),
+        (reason or "").strip() or None,
+        now
     )
 
     return {
@@ -544,9 +525,8 @@ async def save_window(item: Dict[str, Any]) -> int:
     start_index  = _normi(feats.get("start_index"))
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
-    etiqueta     = feats.get("etiqueta")  # puede ser None si aún no se sobrescribe
+    etiqueta     = feats.get("etiqueta")
 
-    # columnas del modelo (por ahora null, las llena el pipeline de ML)
     pred_label   = None
     confianza    = None
     precision    = None
@@ -635,7 +615,6 @@ async def handle_connection(websocket):
                             resp = await stop_session(conn, iid)
                             await websocket.send(json.dumps(resp)); continue
 
-                        # NUEVO: consultar reason de un intervalo
                         elif typ == "get_interval_reason":
                             try:
                                 iid = int(data.get("interval_id"))
@@ -652,7 +631,6 @@ async def handle_connection(websocket):
                                 "duracion": row["duracion"]
                             })); continue
 
-                        # NUEVO: aplicar feedback actividad+duración (segundos) y limpiar reason
                         elif typ == "apply_interval_feedback":
                             try:
                                 iid = int(data.get("interval_id"))
@@ -673,7 +651,7 @@ async def handle_connection(websocket):
                                 "interval_id": row["id"],
                                 "label": row["label"],
                                 "duracion": row["duracion"],
-                                "reason": None
+                                "reason": row["reason"]
                             })); continue
 
                         elif typ == "ping":
