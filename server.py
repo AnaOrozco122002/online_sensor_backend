@@ -270,7 +270,14 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-END_INTERVAL_SQL = "UPDATE intervalos_label SET end_ts = $2 WHERE id = $1 RETURNING id, end_ts"
+# ⬇⬇⬇ CAMBIO AQUÍ: al detener, también fija reason='finish'
+END_INTERVAL_SQL = """
+UPDATE intervalos_label
+SET end_ts = $2,
+    reason = 'finish'
+WHERE id = $1
+RETURNING id, end_ts, reason
+"""
 
 # Leer reason/label/duracion por id de intervalo
 GET_INTERVAL_REASON_SQL = """
@@ -487,7 +494,8 @@ async def stop_session(conn: asyncpg.Connection, interval_id: int):
     row = await conn.fetchrow(END_INTERVAL_SQL, interval_id, now)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
-    return {"ok": True, "interval_id": row["id"], "end_ts": now.isoformat()}
+    # ⬇ opcionalmente devolvemos reason para depurar/verificar
+    return {"ok": True, "interval_id": row["id"], "end_ts": now.isoformat(), "reason": row["reason"]}
 
 # ---------- DB init ----------
 async def init_db():
