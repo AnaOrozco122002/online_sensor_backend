@@ -11,10 +11,20 @@ from typing import Dict, Any, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
+# --- POST al servicio de modelo (stdlib, sin dependencias extra) ---
+import ssl
+import urllib.request
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
+
+# URL del modelo (incluye el endpoint). Se puede sobreescribir con env MODEL_URL
+MODEL_URL = os.getenv(
+    "MODEL_URL",
+    "https://online-server-xgji.onrender.com/predict_by_window"
+)
 
 # ---------- SQL ----------
 CREATE_USERS_SQL = """
@@ -270,7 +280,7 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# ⬇⬇⬇ CAMBIO AQUÍ: al detener, también fija reason='finish'
+# al detener, también fija reason='finish'
 END_INTERVAL_SQL = """
 UPDATE intervalos_label
 SET end_ts = $2,
@@ -405,6 +415,26 @@ def _normi(v):
     except Exception:
         return None
 
+# --- Notificación al modelo ---
+def _post_json_blocking(url: str, body: str, timeout: float = 8.0) -> tuple[int, str]:
+    req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+        status = resp.status
+        text = resp.read(2048).decode("utf-8", "ignore")
+        return status, text
+
+async def notify_model_service(window_id: int):
+    if not MODEL_URL:
+        return
+    body = json.dumps({"id": window_id}, ensure_ascii=False)
+    try:
+        status, text = await asyncio.to_thread(_post_json_blocking, MODEL_URL, body, 8.0)
+        print(f"🤖 Modelo notificado: status={status} resp={text[:180]}")
+    except Exception as e:
+        print(f"⚠️ Falló notificación al modelo: {e}")
+
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
     print(f"📝 register_user: email={email}, name={display_name}, birthday={birthday_str}")
@@ -494,7 +524,6 @@ async def stop_session(conn: asyncpg.Connection, interval_id: int):
     row = await conn.fetchrow(END_INTERVAL_SQL, interval_id, now)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
-    # ⬇ opcionalmente devolvemos reason para depurar/verificar
     return {"ok": True, "interval_id": row["id"], "end_ts": now.isoformat(), "reason": row["reason"]}
 
 # ---------- DB init ----------
@@ -567,6 +596,11 @@ async def save_window(item: Dict[str, Any]) -> int:
 
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
+
+    # Notificar al modelo SOLO con {"id": win_id} (en background)
+    if interval_id is not None:
+        asyncio.create_task(notify_model_service(win_id))
+
     return win_id
 
 # ---------- WS ----------
@@ -596,7 +630,7 @@ async def handle_connection(websocket):
 
                         elif typ == "login":
                             _email = (data.get("email") or "").strip()
-                            _pwd   = data.get("password") or ""
+                            _pwd   = (data.get("password") or "")
                             resp = await login_user(conn, _email, _pwd)
                             await websocket.send(json.dumps(resp)); continue
 
@@ -604,7 +638,7 @@ async def handle_connection(websocket):
                             try: uid = int(data.get("id_usuario"))
                             except Exception:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
-                            resp = await change_password(conn, uid, data.get("old_password") or "", data.get("new_password") or "")
+                            resp = await change_password(conn, uid, (data.get("old_password") or ""), (data.get("new_password") or ""))
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "start_session":
