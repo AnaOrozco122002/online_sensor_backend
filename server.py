@@ -6,11 +6,13 @@ import math
 import asyncio
 import asyncpg
 import websockets
-import aiohttp
 from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+# --- stdlib HTTP (sin dependencias) ---
+import urllib.request
+import urllib.error
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
@@ -410,25 +412,38 @@ def _normi(v):
     except Exception:
         return None
 
-# ---------- Notificación al modelo (solo envío de id) ----------
-async def notify_model(win_id: int):
-    """Envía el id de la ventana al servidor del modelo. No procesa respuesta."""
+# ---------- Notificación al modelo (solo envío de id, sin deps) ----------
+def _post_predict_sync(win_id: int):
+    """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
+    data = json.dumps({"id": win_id}).encode("utf-8")
+    req = urllib.request.Request(
+        PREDICT_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                PREDICT_URL,
-                json={"id": win_id},
-                headers={"Content-Type": "application/json"},
-            ) as resp:
-                # Leemos texto solo para log y no fallar por no-consumir el body
-                _ = await resp.text()
-                if resp.status != 200:
-                    print(f"⚠️ Modelo respondió {resp.status}")
-    except asyncio.TimeoutError:
-        print("⏱️ Falló notificación al modelo: timeout")
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
+            # Leer respuesta solo para consumir el body y evitar conexiones colgadas
+            _ = resp.read()
+            code = resp.getcode()
+            if code != 200:
+                print(f"⚠️ Modelo respondió {code}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        print(f"⚠️ Error HTTP al notificar modelo: {e.code} {body[:200]}")
+    except urllib.error.URLError as e:
+        print(f"⚠️ Error de red al notificar modelo: {e.reason}")
     except Exception as e:
         print(f"💥 Error notificando al modelo: {e}")
+
+async def notify_model(win_id: int):
+    """Envía el id en background sin bloquear el event loop."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _post_predict_sync, win_id)
 
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
@@ -592,7 +607,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
 
-    # Lanza notificación al modelo en background (no bloquea el WS)
+    # Lanza notificación al modelo en background (solo id)
     asyncio.create_task(notify_model(win_id))
 
     return win_id
