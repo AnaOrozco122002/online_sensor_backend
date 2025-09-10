@@ -6,25 +6,21 @@ import math
 import asyncio
 import asyncpg
 import websockets
+import aiohttp
 from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-
-# --- POST al servicio de modelo (stdlib, sin dependencias extra) ---
-import ssl
-import urllib.request
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 POOL: asyncpg.Pool | None = None
 PH = PasswordHasher()
 
-# URL del modelo (incluye el endpoint). Se puede sobreescribir con env MODEL_URL
-MODEL_URL = os.getenv(
-    "MODEL_URL",
-    "https://online-server-xgji.onrender.com/predict_by_window"
-)
+# ---------- Config modelo ----------
+PREDICT_BASE = "https://online-server-xgji.onrender.com"
+PREDICT_URL = f"{PREDICT_BASE}/predict_by_window"
+HTTP_TIMEOUT_SECS = 6  # timeout corto para no bloquear
 
 # ---------- SQL ----------
 CREATE_USERS_SQL = """
@@ -73,7 +69,6 @@ CREATE TABLE IF NOT EXISTS windows (
   n_muestras       INT,
   etiqueta         TEXT,
 
-  -- columnas nuevas del modelo (rellenadas por backend/modelo)
   pred_label       TEXT,
   confianza        DOUBLE PRECISION,
   precision        DOUBLE PRECISION,
@@ -280,7 +275,7 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# al detener, también fija reason='finish'
+# Al detener, fija reason='finish'
 END_INTERVAL_SQL = """
 UPDATE intervalos_label
 SET end_ts = $2,
@@ -415,25 +410,25 @@ def _normi(v):
     except Exception:
         return None
 
-# --- Notificación al modelo ---
-def _post_json_blocking(url: str, body: str, timeout: float = 8.0) -> tuple[int, str]:
-    req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST")
-    req.add_header("Content-Type", "application/json; charset=utf-8")
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-        status = resp.status
-        text = resp.read(2048).decode("utf-8", "ignore")
-        return status, text
-
-async def notify_model_service(window_id: int):
-    if not MODEL_URL:
-        return
-    body = json.dumps({"id": window_id}, ensure_ascii=False)
+# ---------- Notificación al modelo (solo envío de id) ----------
+async def notify_model(win_id: int):
+    """Envía el id de la ventana al servidor del modelo. No procesa respuesta."""
     try:
-        status, text = await asyncio.to_thread(_post_json_blocking, MODEL_URL, body, 8.0)
-        print(f"🤖 Modelo notificado: status={status} resp={text[:180]}")
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                PREDICT_URL,
+                json={"id": win_id},
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                # Leemos texto solo para log y no fallar por no-consumir el body
+                _ = await resp.text()
+                if resp.status != 200:
+                    print(f"⚠️ Modelo respondió {resp.status}")
+    except asyncio.TimeoutError:
+        print("⏱️ Falló notificación al modelo: timeout")
     except Exception as e:
-        print(f"⚠️ Falló notificación al modelo: {e}")
+        print(f"💥 Error notificando al modelo: {e}")
 
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
@@ -597,9 +592,8 @@ async def save_window(item: Dict[str, Any]) -> int:
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
 
-    # Notificar al modelo SOLO con {"id": win_id} (en background)
-    if interval_id is not None:
-        asyncio.create_task(notify_model_service(win_id))
+    # Lanza notificación al modelo en background (no bloquea el WS)
+    asyncio.create_task(notify_model(win_id))
 
     return win_id
 
@@ -638,7 +632,7 @@ async def handle_connection(websocket):
                             try: uid = int(data.get("id_usuario"))
                             except Exception:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
-                            resp = await change_password(conn, uid, (data.get("old_password") or ""), (data.get("new_password") or ""))
+                            resp = await change_password(conn, uid, data.get("old_password") or "", data.get("new_password") or "")
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "start_session":
