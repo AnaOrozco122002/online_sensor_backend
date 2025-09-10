@@ -424,7 +424,6 @@ def _post_predict_sync(win_id: int):
     )
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
-            # Leer respuesta solo para consumir el body y evitar conexiones colgadas
             _ = resp.read()
             code = resp.getcode()
             if code != 200:
@@ -674,10 +673,20 @@ async def handle_connection(websocket):
                             row = await conn.fetchrow(GET_INTERVAL_REASON_SQL, iid)
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
+
+                            # Normaliza reason en minúsculas y sin espacios
+                            r = row["reason"]
+                            if isinstance(r, str):
+                                r = r.strip().lower()
+                            elif r is not None:
+                                r = str(r).strip().lower()
+                            else:
+                                r = None
+
                             await websocket.send(json.dumps({
                                 "ok": True,
                                 "interval_id": row["id"],
-                                "reason": row["reason"],
+                                "reason": r,
                                 "label": row["label"],
                                 "duracion": row["duracion"]
                             })); continue
