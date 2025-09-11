@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE_INTERVALS_SQL = """
 CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
-  session_id  BIGINT NOT NULL,
+  session_id  BIGINT UNIQUE NOT NULL,
   id_usuario  BIGINT REFERENCES users(id_usuario),
   label       TEXT NOT NULL,
   reason      TEXT,
@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA
+# MIGRACIÓN DEFENSIVA: normaliza session_id=id en intervalos_label y asegura FK de windows
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -128,7 +128,7 @@ BEGIN
   END IF;
 END $$;
 
--- Asegurar columnas
+-- Asegurar columnas y tipos (id_usuario, reason, duracion)
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS id_usuario BIGINT,
   ADD COLUMN IF NOT EXISTS reason     TEXT,
@@ -159,15 +159,17 @@ BEGIN
   END IF;
 END $$;
 
--- session_id nulo -> id
+-- Normaliza datos: session_id = id
 UPDATE intervalos_label
 SET session_id = id
-WHERE session_id IS NULL;
+WHERE session_id IS DISTINCT FROM id OR session_id IS NULL;
 
--- Quitar UNIQUE de session_id si existe; crear índice no único
+-- Elimina constraints/índices únicos conflictivos y recrea el único correcto
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'intervalos_label_session_id_key') THEN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'intervalos_label_session_id_key'
+  ) THEN
     ALTER TABLE intervalos_label DROP CONSTRAINT intervalos_label_session_id_key;
   END IF;
 EXCEPTION WHEN undefined_table THEN NULL;
@@ -177,7 +179,11 @@ DROP INDEX IF EXISTS intervalos_label_session_id_key;
 DROP INDEX IF EXISTS idx_intervalos_label_session_id;
 DROP INDEX IF EXISTS uq_intervalos_label_session_id;
 
-CREATE INDEX IF NOT EXISTS idx_intervals_session_id ON intervalos_label (session_id);
+ALTER TABLE intervalos_label
+  ALTER COLUMN session_id SET NOT NULL;
+
+ALTER TABLE intervalos_label
+  ADD CONSTRAINT intervalos_label_session_id_key UNIQUE (session_id);
 
 -- FK a users
 DO $$
@@ -245,7 +251,7 @@ ALTER TABLE windows
   FOREIGN KEY (session_id) REFERENCES intervalos_label(id)
   ON DELETE SET NULL;
 
--- columnas del modelo por si faltaran
+-- WINDOWS: columnas del modelo por si faltaran
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS pred_label  TEXT,
   ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
@@ -271,55 +277,30 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# STOP (sin end_ts): marcar reason='finish' en la ÚLTIMA fila (id MAX) de ese session_id
-END_LAST_OF_SESSION_NO_ENDTS_SQL = """
-WITH last_row AS (
-  SELECT id
-  FROM intervalos_label
-  WHERE session_id = $1
-  ORDER BY id DESC
-  LIMIT 1
-)
-UPDATE intervalos_label il
-SET reason = 'finish'
-FROM last_row
-WHERE il.id = last_row.id
-RETURNING il.id, il.reason;
+# Al detener, fija reason='finish'
+END_INTERVAL_SQL = """
+UPDATE intervalos_label
+SET end_ts = $2,
+    reason = 'finish'
+WHERE id = $1
+RETURNING id, end_ts, reason
 """
 
-# Leer reason/label/duracion de la ÚLTIMA fila (id MAX) para un session_id
-GET_LAST_BY_SESSION_SQL = """
+# Leer reason/label/duracion por id de intervalo
+GET_INTERVAL_REASON_SQL = """
 SELECT id, reason, label, duracion
 FROM intervalos_label
-WHERE session_id = $1
-ORDER BY id DESC
-LIMIT 1
+WHERE id = $1
 """
 
-# Aplicar feedback a la ÚLTIMA fila (id MAX) de ese session_id
-APPLY_FEEDBACK_LAST_SQL = """
-WITH last_row AS (
-  SELECT id
-  FROM intervalos_label
-  WHERE session_id = $1
-  ORDER BY id DESC
-  LIMIT 1
-)
-UPDATE intervalos_label il
+# Aplicar feedback: actualiza label/duracion y deja reason='ok'
+APPLY_INTERVAL_FEEDBACK_SQL = """
+UPDATE intervalos_label
 SET label = $2,
     duracion = $3,
     reason = 'ok'
-FROM last_row
-WHERE il.id = last_row.id
-RETURNING il.id, il.label, il.duracion, il.reason;
-"""
-
-# Etiquetar ventanas de los últimos N segundos para ese session_id
-UPDATE_WINDOWS_LABEL_LAST_SECONDS_SQL = """
-UPDATE windows
-SET etiqueta = $2
-WHERE session_id = $1
-  AND end_time >= (NOW() AT TIME ZONE 'UTC') - ($3::int || ' seconds')::interval;
+WHERE id = $1
+RETURNING id, label, duracion, reason
 """
 
 WINDOWS_INSERT_SQL = """
@@ -395,9 +376,9 @@ def _parse_ts(value):
                 frac = (frac + '000000')[:6]
                 tz = ''
                 for i in range(len(tail)-1, -1, -1):
-                    if tail[i] in '+-':
-                        tz = tail[i:]
-                        break
+                  if tail[i] in '+-':
+                      tz = tail[i:]
+                      break
                 s2 = f"{head}.{frac}{tz}"
                 try:
                     dt = datetime.fromisoformat(s2)
@@ -412,8 +393,7 @@ def _parse_ts(value):
     return value
 
 def _parse_date(s: Optional[str]) -> Optional[date]:
-    if not s:
-        return None
+    if not s: return None
     try:
         return date.fromisoformat(s.strip())
     except Exception:
@@ -432,8 +412,9 @@ def _normi(v):
     except Exception:
         return None
 
-# ---------- Notificación al modelo ----------
+# ---------- Notificación al modelo (solo envío de id, sin deps) ----------
 def _post_predict_sync(win_id: int):
+    """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
     data = json.dumps({"id": win_id}).encode("utf-8")
     req = urllib.request.Request(
         PREDICT_URL,
@@ -459,6 +440,7 @@ def _post_predict_sync(win_id: int):
         print(f"💥 Error notificando al modelo: {e}")
 
 async def notify_model(win_id: int):
+    """Envía el id en background sin bloquear el event loop."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _post_predict_sync, win_id)
 
@@ -473,10 +455,17 @@ async def register_user(conn: asyncpg.Connection, email: str, display_name: Opti
     row = await conn.fetchrow(GET_USER_BY_EMAIL_SQL, email)
     if row and row["password_hash"]:
         return {"ok": False, "code": "email_exists", "message": "El correo ya está registrado"}
+
     pwd_hash = PH.hash(password)
     row = await conn.fetchrow(INSERT_USER_RETURNING_SQL, email, display_name, bday, pwd_hash)
     print(f"✅ register_user OK id={row['id_usuario']}")
-    return {"ok": True, "id_usuario": row["id_usuario"], "email": row["email"], "display_name": row["display_name"], "birthday": birthday_str}
+    return {
+        "ok": True,
+        "id_usuario": row["id_usuario"],
+        "email": row["email"],
+        "display_name": row["display_name"],
+        "birthday": birthday_str
+    }
 
 async def login_user(conn: asyncpg.Connection, email: str, password: str):
     print(f"🔐 login_user: email={email}")
@@ -491,7 +480,12 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
         return {"ok": False, "code": "invalid_credentials", "message": "Credenciales inválidas"}
     await conn.execute("UPDATE users SET last_seen_at = NOW() WHERE id_usuario = $1", row["id_usuario"])
     print(f"✅ login_user OK id={row['id_usuario']}")
-    return {"ok": True, "id_usuario": row["id_usuario"], "email": email, "display_name": row["display_name"]}
+    return {
+        "ok": True,
+        "id_usuario": row["id_usuario"],
+        "email": email,
+        "display_name": row["display_name"]
+    }
 
 async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
     print(f"🛠 change_password: id={user_id}")
@@ -519,34 +513,32 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
 
     row = await conn.fetchrow(
         INSERT_INTERVAL_WITH_ID_SQL,
-        new_id,  # id
+        new_id,
         user_id,
         label.strip(),
         (reason or "").strip() or None,
         now
     )
 
-    # id == session_id
     return {
         "ok": True,
-        "interval_id": row["session_id"],
+        "interval_id": row["id"],
         "session_id": row["session_id"],
         "label": row["label"],
         "start_ts": row["start_ts"].isoformat()
     }
 
-async def stop_session(conn: asyncpg.Connection, session_id: int):
-    # sin end_ts, solo reason='finish' en la última fila de ese session_id
-    row = await conn.fetchrow(END_LAST_OF_SESSION_NO_ENDTS_SQL, session_id)
+async def stop_session(conn: asyncpg.Connection, interval_id: int):
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    row = await conn.fetchrow(END_INTERVAL_SQL, interval_id, now)
     if not row:
-        return {"ok": False, "code": "not_found", "message": "Sesión no encontrada para ese session_id"}
-    return {"ok": True, "interval_id": session_id, "reason": row["reason"]}
+        return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
+    return {"ok": True, "interval_id": row["id"], "end_ts": now.isoformat(), "reason": row["reason"]}
 
 # ---------- DB init ----------
 async def init_db():
     if not DATABASE_URL:
-        print("❌ DATABASE_URL no está configurada")
-        raise RuntimeError("DATABASE_URL missing")
+        print("❌ DATABASE_URL no está configurada"); raise RuntimeError("DATABASE_URL missing")
     print("🔌 Conectando a Postgres...")
     global POOL
     POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -563,10 +555,8 @@ async def save_window(item: Dict[str, Any]) -> int:
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
     def _as_int(v):
-        try:
-            return int(v)
-        except Exception:
-            return None
+        try: return int(v)
+        except Exception: return None
 
     id_usuario = _as_int(item.get("id_usuario"))
     interval_id = _as_int(item.get("session_id"))  # FK a intervalos_label.id
@@ -575,13 +565,27 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_time     = _parse_ts(item.get("end_time"))
     sample_count = _normi(item.get("sample_count"))
     sample_rate  = _normf(item.get("sample_rate_hz"))
-    feats        = item.get("features") or {}
+    feats        = dict(item.get("features") or {})
     samples      = item.get("samples")
+
+    # Buscar la etiqueta vigente del intervalo y aplicarla a la ventana (columna y JSON)
+    etiqueta_intervalo = None
+    if interval_id is not None:
+        async with POOL.acquire() as conn:
+            etiqueta_intervalo = await conn.fetchval(
+                "SELECT label FROM intervalos_label WHERE id = $1",
+                interval_id
+            )
+    # Si existe etiqueta del intervalo, la imponemos; así ninguna ventana queda sin etiqueta
+    if etiqueta_intervalo:
+        feats["etiqueta"] = etiqueta_intervalo
+        etiqueta = etiqueta_intervalo
+    else:
+        etiqueta = feats.get("etiqueta")
 
     start_index  = _normi(feats.get("start_index"))
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
-    etiqueta     = feats.get("etiqueta")
 
     pred_label   = None
     confianza    = None
@@ -616,7 +620,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
 
-    # notificar al modelo en background (solo id)
+    # Lanza notificación al modelo en background (solo id)
     asyncio.create_task(notify_model(win_id))
 
     return win_id
@@ -642,7 +646,7 @@ async def handle_connection(websocket):
                             _email = (data.get("email") or "").strip()
                             _name  = (data.get("display_name") or "").strip() or None
                             _bday  = (data.get("birthday") or "").strip() or None
-                            _pwd   = data.get("password") or ""
+                            _pwd   = (data.get("password") or "")
                             resp = await register_user(conn, _email, _name, _bday, _pwd)
                             await websocket.send(json.dumps(resp)); continue
 
@@ -653,16 +657,14 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "change_password":
-                            try:
-                                uid = int(data.get("id_usuario"))
+                            try: uid = int(data.get("id_usuario"))
                             except Exception:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
                             resp = await change_password(conn, uid, data.get("old_password") or "", data.get("new_password") or "")
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "start_session":
-                            try:
-                                uid = int(data.get("id_usuario"))
+                            try: uid = int(data.get("id_usuario"))
                             except Exception:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_id", "message": "id_usuario inválido"})); continue
                             label  = (data.get("label") or "").strip()
@@ -671,44 +673,33 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "stop_session":
-                            # El cliente manda "interval_id" pero lo usamos como session_id
-                            try:
-                                sess = int(data.get("interval_id"))
+                            try: iid = int(data.get("interval_id"))
                             except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "session_id inválido"})); continue
-                            resp = await stop_session(conn, sess)
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
+                            resp = await stop_session(conn, iid)
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "get_interval_reason":
-                            # El cliente manda "interval_id" pero lo usamos como session_id
                             try:
-                                sess = int(data.get("interval_id"))
+                                iid = int(data.get("interval_id"))
                             except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "session_id inválido"})); continue
-                            row = await conn.fetchrow(GET_LAST_BY_SESSION_SQL, sess)
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
+                            row = await conn.fetchrow(GET_INTERVAL_REASON_SQL, iid)
                             if not row:
-                                await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "No hay filas para ese session_id"})); continue
-                            r = row["reason"]
-                            if isinstance(r, str):
-                                r = r.strip().lower()
-                            elif r is not None:
-                                r = str(r).strip().lower()
-                            else:
-                                r = None
+                                await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
                             await websocket.send(json.dumps({
                                 "ok": True,
-                                "interval_id": sess,
-                                "reason": r,
+                                "interval_id": row["id"],
+                                "reason": row["reason"],
                                 "label": row["label"],
                                 "duracion": row["duracion"]
                             })); continue
 
                         elif typ == "apply_interval_feedback":
-                            # El cliente manda "interval_id" pero lo usamos como session_id
                             try:
-                                sess = int(data.get("interval_id"))
+                                iid = int(data.get("interval_id"))
                             except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "session_id inválido"})); continue
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
                             new_label = (data.get("label") or "").strip()
                             try:
                                 dur = int(data.get("duracion") or 0)
@@ -716,18 +707,12 @@ async def handle_connection(websocket):
                                 dur = 0
                             if not new_label:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_label", "message": "Actividad requerida"})); continue
-
-                            # 1) Actualiza la última fila del intervalo
-                            row = await conn.fetchrow(APPLY_FEEDBACK_LAST_SQL, sess, new_label, dur)
+                            row = await conn.fetchrow(APPLY_INTERVAL_FEEDBACK_SQL, iid, new_label, dur)
                             if not row:
-                                await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "No hay filas para ese session_id"})); continue
-
-                            # 2) Etiqueta ventanas recientes del mismo session_id en los últimos 'dur' segundos
-                            await conn.execute(UPDATE_WINDOWS_LABEL_LAST_SECONDS_SQL, sess, new_label, dur)
-
+                                await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
                             await websocket.send(json.dumps({
                                 "ok": True,
-                                "interval_id": sess,
+                                "interval_id": row["id"],
                                 "label": row["label"],
                                 "duracion": row["duracion"],
                                 "reason": row["reason"]
@@ -740,13 +725,11 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps({"ok": False, "code": "unknown_type", "message": "Tipo de RPC desconocido"})); continue
                 except Exception as e:
                     print(f"💥 Error en RPC {typ}: {e}")
-                    try:
-                        await websocket.send(json.dumps({"ok": False, "code": "server_error", "message": str(e)}))
-                    except Exception:
-                        pass
+                    try: await websocket.send(json.dumps({"ok": False, "code": "server_error", "message": str(e)}))
+                    except Exception: pass
                     continue
 
-            # Ventanas (array u objeto)
+            # Ventanas (array o objeto)
             items = data if isinstance(data, list) else [data]
             acks = []
             for item in items:
