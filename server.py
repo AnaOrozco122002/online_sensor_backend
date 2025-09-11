@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA
+# MIGRACIÓN DEFENSIVA: normaliza session_id=id en intervalos_label y asegura FK de windows
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -164,7 +164,7 @@ UPDATE intervalos_label
 SET session_id = id
 WHERE session_id IS DISTINCT FROM id OR session_id IS NULL;
 
--- Limpiar y dejar único
+-- Elimina constraints/índices únicos conflictivos y recrea el único correcto
 DO $$
 BEGIN
   IF EXISTS (
@@ -277,7 +277,7 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# Al detener, fija reason='finish' (dejamos end_ts como está en tu versión actual)
+# Al detener, fija reason='finish'
 END_INTERVAL_SQL = """
 UPDATE intervalos_label
 SET end_ts = $2,
@@ -286,20 +286,20 @@ WHERE id = $1
 RETURNING id, end_ts, reason
 """
 
-# Leer reason/label/duracion por id de intervalo
+# Leer reason/label/duracion por id de intervalo  (FORZAMOS TIPO)
 GET_INTERVAL_REASON_SQL = """
 SELECT id, reason, label, duracion
 FROM intervalos_label
-WHERE id = $1
+WHERE id = $1::bigint
 """
 
-# Aplicar feedback: actualiza label/duracion y deja reason='ok'
+# Aplicar feedback: actualiza label/duracion y deja reason='ok'  (FORZAMOS TIPO)
 APPLY_INTERVAL_FEEDBACK_SQL = """
 UPDATE intervalos_label
-SET label = $2,
+SET label   = $2,
     duracion = $3,
-    reason = 'ok'
-WHERE id = $1
+    reason  = 'ok'
+WHERE id = $1::bigint
 RETURNING id, label, duracion, reason
 """
 
@@ -414,6 +414,7 @@ def _normi(v):
 
 # ---------- Notificación al modelo (solo envío de id, sin deps) ----------
 def _post_predict_sync(win_id: int):
+    """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
     data = json.dumps({"id": win_id}).encode("utf-8")
     req = urllib.request.Request(
         PREDICT_URL,
@@ -439,6 +440,7 @@ def _post_predict_sync(win_id: int):
         print(f"💥 Error notificando al modelo: {e}")
 
 async def notify_model(win_id: int):
+    """Envía el id en background sin bloquear el event loop."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _post_predict_sync, win_id)
 
@@ -557,34 +559,19 @@ async def save_window(item: Dict[str, Any]) -> int:
         except Exception: return None
 
     id_usuario = _as_int(item.get("id_usuario"))
-    interval_id = _as_int(item.get("session_id"))
+    interval_id = _as_int(item.get("session_id"))  # FK a intervalos_label.id
 
     start_time   = _parse_ts(item.get("start_time"))
     end_time     = _parse_ts(item.get("end_time"))
     sample_count = _normi(item.get("sample_count"))
     sample_rate  = _normf(item.get("sample_rate_hz"))
-    feats        = dict(item.get("features") or {})
+    feats        = item.get("features") or {}
     samples      = item.get("samples")
-
-    # 1) tomar la etiqueta vigente del intervalo
-    etiqueta_intervalo = None
-    if interval_id is not None:
-        async with POOL.acquire() as conn:
-            etiqueta_intervalo = await conn.fetchval(
-                "SELECT label FROM intervalos_label WHERE id = $1",
-                interval_id
-            )
-
-    # 2) imponerla en la ventana (columna y JSON)
-    if etiqueta_intervalo:
-        feats["etiqueta"] = etiqueta_intervalo
-        etiqueta = etiqueta_intervalo
-    else:
-        etiqueta = feats.get("etiqueta")
 
     start_index  = _normi(feats.get("start_index"))
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
+    etiqueta     = feats.get("etiqueta")
 
     pred_label   = None
     confianza    = None
@@ -619,7 +606,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
 
-    # Notificar modelo en background
+    # Lanza notificación al modelo en background (solo id)
     asyncio.create_task(notify_model(win_id))
 
     return win_id
@@ -707,43 +694,9 @@ async def handle_connection(websocket):
                             if not new_label:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_label", "message": "Actividad requerida"})); continue
 
-                            # 1) Actualiza intervalo (label/duracion, reason='ok')
                             row = await conn.fetchrow(APPLY_INTERVAL_FEEDBACK_SQL, iid, new_label, dur)
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
-
-                            # 2) Re-etiqueta ventanas recientes según duración
-                            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-                            if dur > 0:
-                                cutoff = now_utc - timedelta(seconds=dur)
-                                await conn.execute(
-                                    """
-                                    UPDATE windows
-                                    SET etiqueta = $1,
-                                        features = COALESCE(features, '{}'::jsonb) || jsonb_build_object('etiqueta', $1)
-                                    WHERE session_id = $2
-                                      AND end_time >= $3
-                                    """,
-                                    new_label, iid, cutoff
-                                )
-                            else:
-                                # sin duración: solo la última ventana de la sesión
-                                await conn.execute(
-                                    """
-                                    WITH last_w AS (
-                                      SELECT id FROM windows
-                                      WHERE session_id = $1
-                                      ORDER BY end_time DESC
-                                      LIMIT 1
-                                    )
-                                    UPDATE windows w
-                                    SET etiqueta = $2,
-                                        features = COALESCE(features, '{}'::jsonb) || jsonb_build_object('etiqueta', $2)
-                                    FROM last_w
-                                    WHERE w.id = last_w.id
-                                    """,
-                                    iid, new_label
-                                )
 
                             await websocket.send(json.dumps({
                                 "ok": True,
@@ -751,8 +704,7 @@ async def handle_connection(websocket):
                                 "label": row["label"],
                                 "duracion": row["duracion"],
                                 "reason": row["reason"]
-                            }))
-                            continue
+                            })); continue
 
                         elif typ == "ping":
                             await websocket.send(json.dumps({"ok": True, "type": "pong"})); continue
