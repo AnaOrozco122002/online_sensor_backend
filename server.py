@@ -25,7 +25,7 @@ PREDICT_URL = f"{PREDICT_BASE}/predict_by_window"
 HTTP_TIMEOUT_SECS = 6  # timeout corto para no bloquear
 
 # ---------- Cache en memoria de etiqueta vigente por sesión ----------
-# Clave: session_id (intervalos_label.id)  Valor: str (label vigente)
+# Clave: session_id (grupo)  Valor: str (label vigente)
 SESSION_ACTIVITY: Dict[int, str] = {}
 
 # ---------- SQL ----------
@@ -41,10 +41,11 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+#-- -- ATENCIÓN: session_id YA NO ES UNIQUE
 CREATE_INTERVALS_SQL = """
 CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
-  session_id  BIGINT UNIQUE NOT NULL,
+  session_id  BIGINT NOT NULL,
   id_usuario  BIGINT REFERENCES users(id_usuario),
   label       TEXT NOT NULL,
   reason      TEXT,
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS intervalos_label (
 );
 CREATE INDEX IF NOT EXISTS idx_intervals_created ON intervalos_label (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intervals_user    ON intervalos_label (id_usuario);
+CREATE INDEX IF NOT EXISTS idx_intervals_session ON intervalos_label (session_id);
 """
 
 CREATE_WINDOWS_SQL = """
@@ -101,7 +103,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA: normaliza session_id=id en intervalos_label y asegura FK de windows
+# MIGRACIÓN DEFENSIVA: elimina UNIQUE en session_id y asegura índices/FKs
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -132,13 +134,13 @@ BEGIN
   END IF;
 END $$;
 
--- Asegurar columnas y tipos (id_usuario, reason, duracion)
+-- Asegurar columnas
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS id_usuario BIGINT,
   ADD COLUMN IF NOT EXISTS reason     TEXT,
   ADD COLUMN IF NOT EXISTS duracion   INTEGER;
 
--- Asegura session_id BIGINT
+-- Asegurar session_id BIGINT (sin UNIQUE)
 DO $$
 DECLARE
   _data_type TEXT;
@@ -163,12 +165,7 @@ BEGIN
   END IF;
 END $$;
 
--- Normaliza datos: session_id = id
-UPDATE intervalos_label
-SET session_id = id
-WHERE session_id IS DISTINCT FROM id OR session_id IS NULL;
-
--- Elimina constraints/índices únicos conflictivos y recrea el único correcto
+-- Quitar UNIQUE si existía
 DO $$
 BEGIN
   IF EXISTS (
@@ -180,14 +177,13 @@ EXCEPTION WHEN undefined_table THEN NULL;
 END $$;
 
 DROP INDEX IF EXISTS intervalos_label_session_id_key;
-DROP INDEX IF EXISTS idx_intervalos_label_session_id;
 DROP INDEX IF EXISTS uq_intervalos_label_session_id;
 
+-- Asegurar NOT NULL y un índice normal por session_id
 ALTER TABLE intervalos_label
   ALTER COLUMN session_id SET NOT NULL;
 
-ALTER TABLE intervalos_label
-  ADD CONSTRAINT intervalos_label_session_id_key UNIQUE (session_id);
+CREATE INDEX IF NOT EXISTS idx_intervals_session ON intervalos_label (session_id);
 
 -- FK a users
 DO $$
@@ -208,15 +204,15 @@ END $$;
 -- WINDOWS: asegurar session_id BIGINT y FK a intervalos_label(id)
 DO $$
 DECLARE
-  _data_type TEXT;
+  _data_type2 TEXT;
 BEGIN
-  SELECT data_type INTO _data_type
+  SELECT data_type INTO _data_type2
   FROM information_schema.columns
   WHERE table_name='windows' AND column_name='session_id';
 
-  IF _data_type IS NULL THEN
+  IF _data_type2 IS NULL THEN
     ALTER TABLE windows ADD COLUMN session_id BIGINT;
-  ELSIF _data_type <> 'bigint' THEN
+  ELSIF _data_type2 <> 'bigint' THEN
     ALTER TABLE windows ADD COLUMN IF NOT EXISTS session_id_new BIGINT;
 
     UPDATE windows
@@ -255,7 +251,7 @@ ALTER TABLE windows
   FOREIGN KEY (session_id) REFERENCES intervalos_label(id)
   ON DELETE SET NULL;
 
--- WINDOWS: columnas del modelo por si faltaran
+-- WINDOWS: columnas del modelo (por si faltaran)
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS pred_label  TEXT,
   ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
@@ -272,7 +268,7 @@ RETURNING id_usuario, email, display_name, birthday
 """
 SET_PASSWORD_SQL = "UPDATE users SET password_hash = $2, last_seen_at = NOW() WHERE id_usuario = $1"
 
-# Inserción de intervalo con id preasignado == session_id
+# Inserción de intervalo con id preasignado; por defecto usamos id como session_id NUEVO
 GET_NEXT_INTERVAL_ID_SQL = "SELECT nextval(pg_get_serial_sequence('intervalos_label','id')) AS new_id"
 
 INSERT_INTERVAL_WITH_ID_SQL = """
@@ -281,29 +277,45 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# ⬇️ STOP: solo reason='finish' (no end_ts)
-END_INTERVAL_SQL = """
+# --- Consultas auxiliares para "última fila por session_id" ---
+GET_SESSION_ID_BY_INTERVAL_ID_SQL = """
+SELECT session_id FROM intervalos_label WHERE id = $1
+"""
+
+GET_LATEST_INTERVAL_FOR_SESSION_SQL = """
+SELECT id, session_id, reason, label, duracion
+FROM intervalos_label
+WHERE session_id = $1
+ORDER BY id DESC
+LIMIT 1
+"""
+
+# stop: solo cambia reason a 'finish' en la última fila por session_id (NO toca end_ts)
+STOP_BY_SESSION_SQL = """
 UPDATE intervalos_label
 SET reason = 'finish'
-WHERE id = $1
-RETURNING id, reason
+WHERE id = (
+  SELECT id FROM intervalos_label
+  WHERE session_id = $1
+  ORDER BY id DESC
+  LIMIT 1
+)
+RETURNING id, session_id, reason
 """
 
-# Leer reason/label/duracion por id de intervalo (FORZAMOS TIPO)
-GET_INTERVAL_REASON_SQL = """
-SELECT id, reason, label, duracion
-FROM intervalos_label
-WHERE id = $1::bigint
-"""
-
-# Aplicar feedback: actualiza label/duracion y deja reason='ok' (FORZAMOS TIPO)
-APPLY_INTERVAL_FEEDBACK_SQL = """
+# Actualiza label/duracion/razón en la última fila por session_id
+APPLY_FEEDBACK_BY_SESSION_SQL = """
 UPDATE intervalos_label
 SET label   = $2,
     duracion = $3,
     reason  = 'ok'
-WHERE id = $1::bigint
-RETURNING id, label, duracion, reason
+WHERE id = (
+  SELECT id FROM intervalos_label
+  WHERE session_id = $1
+  ORDER BY id DESC
+  LIMIT 1
+)
+RETURNING id, session_id, label, duracion, reason
 """
 
 # Backfill de ventanas por duración hacia atrás desde "ahora" (UTC)
@@ -458,7 +470,6 @@ async def notify_model(win_id: int):
 
 # ---------- Helpers de etiqueta vigente ----------
 async def _db_fetch_latest_label_for_session(conn: asyncpg.Connection, session_id: int) -> Optional[str]:
-    # última fila para ese session_id (igual a id) por si hay duplicados históricos
     row = await conn.fetchrow("""
         SELECT label
         FROM intervalos_label
@@ -471,16 +482,26 @@ async def _db_fetch_latest_label_for_session(conn: asyncpg.Connection, session_i
     return None
 
 async def _get_current_label(session_id: int) -> Optional[str]:
-    # cache en memoria primero
     if session_id in SESSION_ACTIVITY:
         return SESSION_ACTIVITY[session_id]
-    # fallback a DB y cachear
     assert POOL is not None
     async with POOL.acquire() as conn:
         lab = await _db_fetch_latest_label_for_session(conn, session_id)
         if lab:
             SESSION_ACTIVITY[session_id] = lab
         return lab
+
+async def _resolve_session_id(conn: asyncpg.Connection, maybe_interval_id: Optional[int], maybe_session_id: Optional[int]) -> Optional[int]:
+    """
+    Si recibimos session_id directamente, úsalo.
+    Si recibimos interval_id, buscamos su session_id.
+    """
+    if maybe_session_id is not None:
+        return maybe_session_id
+    if maybe_interval_id is not None:
+        sid = await conn.fetchval(GET_SESSION_ID_BY_INTERVAL_ID_SQL, maybe_interval_id)
+        return int(sid) if sid is not None else None
+    return None
 
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
@@ -563,18 +584,18 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
 
     return {
         "ok": True,
-        "interval_id": row["id"],
-        "session_id": row["session_id"],
+        "interval_id": row["id"],       # id de esta fila
+        "session_id": row["session_id"],# grupo (puede tener varias filas a futuro)
         "label": row["label"],
         "start_ts": row["start_ts"].isoformat()
     }
 
-async def stop_session(conn: asyncpg.Connection, interval_id: int):
-    # Ya NO tocamos end_ts. Solo marcamos reason='finish'
-    row = await conn.fetchrow(END_INTERVAL_SQL, interval_id)
+# stop por SESSION (no tocamos end_ts, solo reason='finish' en la última fila del grupo)
+async def stop_session_by_session(conn: asyncpg.Connection, session_id: int):
+    row = await conn.fetchrow(STOP_BY_SESSION_SQL, session_id)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
-    return {"ok": True, "interval_id": row["id"], "reason": row["reason"]}
+    return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "reason": row["reason"]}
 
 # ---------- DB init ----------
 async def init_db():
@@ -675,7 +696,7 @@ async def handle_connection(websocket):
                 try:
                     async with POOL.acquire() as conn:
                         if typ == "register":
-                            _email = (data.get("email") or "").strip()
+                            _email = (data.get("email") or "").trim() if hasattr((data.get("email") or ""), "trim") else (data.get("email") or "").strip()
                             _name  = (data.get("display_name") or "").strip() or None
                             _bday  = (data.get("birthday") or "").strip() or None
                             _pwd   = (data.get("password") or "")
@@ -705,33 +726,57 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "stop_session":
-                            try: iid = int(data.get("interval_id"))
+                            # Compatibilidad: aceptar session_id o interval_id
+                            session_id = data.get("session_id")
+                            interval_id = data.get("interval_id")
+                            try:
+                                session_id = int(session_id) if session_id is not None else None
                             except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
-                            resp = await stop_session(conn, iid)
+                                session_id = None
+                            try:
+                                interval_id = int(interval_id) if interval_id is not None else None
+                            except Exception:
+                                interval_id = None
+
+                            sid = await _resolve_session_id(conn, interval_id, session_id)
+                            if sid is None:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_session", "message": "No se pudo resolver session_id"})); continue
+
+                            resp = await stop_session_by_session(conn, sid)
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "get_interval_reason":
+                            # Compat: aceptar interval_id o session_id; devolver la ÚLTIMA fila del session_id
+                            session_id = data.get("session_id")
+                            interval_id = data.get("interval_id")
                             try:
-                                iid = int(data.get("interval_id"))
+                                session_id = int(session_id) if session_id is not None else None
                             except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
-                            row = await conn.fetchrow(GET_INTERVAL_REASON_SQL, iid)
+                                session_id = None
+                            try:
+                                interval_id = int(interval_id) if interval_id is not None else None
+                            except Exception:
+                                interval_id = None
+
+                            sid = await _resolve_session_id(conn, interval_id, session_id)
+                            if sid is None:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_session", "message": "No se pudo resolver session_id"})); continue
+
+                            row = await conn.fetchrow(GET_LATEST_INTERVAL_FOR_SESSION_SQL, sid)
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
+
                             await websocket.send(json.dumps({
                                 "ok": True,
                                 "interval_id": row["id"],
+                                "session_id": row["session_id"],
                                 "reason": row["reason"],
                                 "label": row["label"],
                                 "duracion": row["duracion"]
                             })); continue
 
                         elif typ == "apply_interval_feedback":
-                            try:
-                                iid = int(data.get("interval_id"))
-                            except Exception:
-                                await websocket.send(json.dumps({"ok": False, "code": "bad_interval_id", "message": "interval_id inválido"})); continue
+                            # Compat: aceptar interval_id o session_id; aplicar sobre la ÚLTIMA fila del session_id
                             new_label = (data.get("label") or "").strip()
                             try:
                                 dur = int(data.get("duracion") or 0)
@@ -740,23 +785,38 @@ async def handle_connection(websocket):
                             if not new_label:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_label", "message": "Actividad requerida"})); continue
 
-                            # 1) Actualiza intervalo (label, duracion, reason='ok')
-                            row = await conn.fetchrow(APPLY_INTERVAL_FEEDBACK_SQL, iid, new_label, dur)
+                            session_id = data.get("session_id")
+                            interval_id = data.get("interval_id")
+                            try:
+                                session_id = int(session_id) if session_id is not None else None
+                            except Exception:
+                                session_id = None
+                            try:
+                                interval_id = int(interval_id) if interval_id is not None else None
+                            except Exception:
+                                interval_id = None
+
+                            sid = await _resolve_session_id(conn, interval_id, session_id)
+                            if sid is None:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_session", "message": "No se pudo resolver session_id"})); continue
+
+                            row = await conn.fetchrow(APPLY_FEEDBACK_BY_SESSION_SQL, sid, new_label, dur)
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
 
                             # 2) Backfill de ventanas previas (ahora - dur .. ahora)
                             try:
-                                await conn.execute(WINDOWS_BACKFILL_SQL, new_label, iid, dur)
+                                await conn.execute(WINDOWS_BACKFILL_SQL, new_label, sid, dur)
                             except Exception as e:
                                 print(f"⚠️ Backfill windows falló: {e}")
 
                             # 3) Actualiza etiqueta vigente en cache para futuras ventanas
-                            SESSION_ACTIVITY[iid] = new_label
+                            SESSION_ACTIVITY[sid] = new_label
 
                             await websocket.send(json.dumps({
                                 "ok": True,
                                 "interval_id": row["id"],
+                                "session_id": row["session_id"],
                                 "label": row["label"],
                                 "duracion": row["duracion"],
                                 "reason": row["reason"]
