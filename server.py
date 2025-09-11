@@ -281,13 +281,12 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# Al detener, fija reason='finish' (no tocamos end_ts si no quieres, solo ejemplo previo)
+# ⬇️ STOP: solo reason='finish' (no end_ts)
 END_INTERVAL_SQL = """
 UPDATE intervalos_label
-SET end_ts = $2,
-    reason = 'finish'
+SET reason = 'finish'
 WHERE id = $1
-RETURNING id, end_ts, reason
+RETURNING id, reason
 """
 
 # Leer reason/label/duracion por id de intervalo (FORZAMOS TIPO)
@@ -571,11 +570,11 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
     }
 
 async def stop_session(conn: asyncpg.Connection, interval_id: int):
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(END_INTERVAL_SQL, interval_id, now)
+    # Ya NO tocamos end_ts. Solo marcamos reason='finish'
+    row = await conn.fetchrow(END_INTERVAL_SQL, interval_id)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
-    return {"ok": True, "interval_id": row["id"], "end_ts": now.isoformat(), "reason": row["reason"]}
+    return {"ok": True, "interval_id": row["id"], "reason": row["reason"]}
 
 # ---------- DB init ----------
 async def init_db():
@@ -618,7 +617,6 @@ async def save_window(item: Dict[str, Any]) -> int:
     etiqueta_vigente = None
     if interval_id is not None:
         etiqueta_vigente = await _get_current_label(interval_id)
-    # si no se pudo determinar, deja None
     etiqueta = etiqueta_vigente
 
     pred_label   = None
