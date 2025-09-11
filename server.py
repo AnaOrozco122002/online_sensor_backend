@@ -24,6 +24,10 @@ PREDICT_BASE = "https://online-server-xgji.onrender.com"
 PREDICT_URL = f"{PREDICT_BASE}/predict_by_window"
 HTTP_TIMEOUT_SECS = 6  # timeout corto para no bloquear
 
+# ---------- Cache en memoria de etiqueta vigente por sesión ----------
+# Clave: session_id (intervalos_label.id)  Valor: str (label vigente)
+SESSION_ACTIVITY: Dict[int, str] = {}
+
 # ---------- SQL ----------
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -277,7 +281,7 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# Al detener, fija reason='finish'
+# Al detener, fija reason='finish' (no tocamos end_ts si no quieres, solo ejemplo previo)
 END_INTERVAL_SQL = """
 UPDATE intervalos_label
 SET end_ts = $2,
@@ -286,14 +290,14 @@ WHERE id = $1
 RETURNING id, end_ts, reason
 """
 
-# Leer reason/label/duracion por id de intervalo  (FORZAMOS TIPO)
+# Leer reason/label/duracion por id de intervalo (FORZAMOS TIPO)
 GET_INTERVAL_REASON_SQL = """
 SELECT id, reason, label, duracion
 FROM intervalos_label
 WHERE id = $1::bigint
 """
 
-# Aplicar feedback: actualiza label/duracion y deja reason='ok'  (FORZAMOS TIPO)
+# Aplicar feedback: actualiza label/duracion y deja reason='ok' (FORZAMOS TIPO)
 APPLY_INTERVAL_FEEDBACK_SQL = """
 UPDATE intervalos_label
 SET label   = $2,
@@ -301,6 +305,15 @@ SET label   = $2,
     reason  = 'ok'
 WHERE id = $1::bigint
 RETURNING id, label, duracion, reason
+"""
+
+# Backfill de ventanas por duración hacia atrás desde "ahora" (UTC)
+WINDOWS_BACKFILL_SQL = """
+UPDATE windows
+SET etiqueta = $1
+WHERE session_id = $2
+  AND end_time >= (NOW() AT TIME ZONE 'UTC') - ($3::int * INTERVAL '1 second')
+  AND end_time <= (NOW() AT TIME ZONE 'UTC');
 """
 
 WINDOWS_INSERT_SQL = """
@@ -444,6 +457,32 @@ async def notify_model(win_id: int):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _post_predict_sync, win_id)
 
+# ---------- Helpers de etiqueta vigente ----------
+async def _db_fetch_latest_label_for_session(conn: asyncpg.Connection, session_id: int) -> Optional[str]:
+    # última fila para ese session_id (igual a id) por si hay duplicados históricos
+    row = await conn.fetchrow("""
+        SELECT label
+        FROM intervalos_label
+        WHERE session_id = $1
+        ORDER BY id DESC
+        LIMIT 1
+    """, session_id)
+    if row and row["label"]:
+        return row["label"]
+    return None
+
+async def _get_current_label(session_id: int) -> Optional[str]:
+    # cache en memoria primero
+    if session_id in SESSION_ACTIVITY:
+        return SESSION_ACTIVITY[session_id]
+    # fallback a DB y cachear
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        lab = await _db_fetch_latest_label_for_session(conn, session_id)
+        if lab:
+            SESSION_ACTIVITY[session_id] = lab
+        return lab
+
 # ---------- Auth helpers ----------
 async def register_user(conn: asyncpg.Connection, email: str, display_name: Optional[str], birthday_str: Optional[str], password: str):
     print(f"📝 register_user: email={email}, name={display_name}, birthday={birthday_str}")
@@ -520,6 +559,9 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         now
     )
 
+    # cachear etiqueta vigente para este session_id
+    SESSION_ACTIVITY[row["session_id"]] = row["label"]
+
     return {
         "ok": True,
         "interval_id": row["id"],
@@ -571,7 +613,13 @@ async def save_window(item: Dict[str, Any]) -> int:
     start_index  = _normi(feats.get("start_index"))
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
-    etiqueta     = feats.get("etiqueta")
+
+    # etiqueta vigente (SERVIDOR impone)
+    etiqueta_vigente = None
+    if interval_id is not None:
+        etiqueta_vigente = await _get_current_label(interval_id)
+    # si no se pudo determinar, deja None
+    etiqueta = etiqueta_vigente
 
     pred_label   = None
     confianza    = None
@@ -694,9 +742,19 @@ async def handle_connection(websocket):
                             if not new_label:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_label", "message": "Actividad requerida"})); continue
 
+                            # 1) Actualiza intervalo (label, duracion, reason='ok')
                             row = await conn.fetchrow(APPLY_INTERVAL_FEEDBACK_SQL, iid, new_label, dur)
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
+
+                            # 2) Backfill de ventanas previas (ahora - dur .. ahora)
+                            try:
+                                await conn.execute(WINDOWS_BACKFILL_SQL, new_label, iid, dur)
+                            except Exception as e:
+                                print(f"⚠️ Backfill windows falló: {e}")
+
+                            # 3) Actualiza etiqueta vigente en cache para futuras ventanas
+                            SESSION_ACTIVITY[iid] = new_label
 
                             await websocket.send(json.dumps({
                                 "ok": True,
