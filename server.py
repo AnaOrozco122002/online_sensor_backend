@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA: session_id puede repetirse; operar por última fila (id MAX) de ese session_id
+# MIGRACIÓN DEFENSIVA
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -128,7 +128,7 @@ BEGIN
   END IF;
 END $$;
 
--- Asegurar columnas y tipos (id_usuario, reason, duracion)
+-- Asegurar columnas
 ALTER TABLE intervalos_label
   ADD COLUMN IF NOT EXISTS id_usuario BIGINT,
   ADD COLUMN IF NOT EXISTS reason     TEXT,
@@ -159,12 +159,12 @@ BEGIN
   END IF;
 END $$;
 
--- Normaliza datos: si session_id es NULL, pon id
+-- session_id nulo -> id
 UPDATE intervalos_label
 SET session_id = id
 WHERE session_id IS NULL;
 
--- Quita UNIQUE de session_id (si existía) y crea índice NO único
+-- Quitar UNIQUE de session_id si existe; crear índice no único
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'intervalos_label_session_id_key') THEN
@@ -245,7 +245,7 @@ ALTER TABLE windows
   FOREIGN KEY (session_id) REFERENCES intervalos_label(id)
   ON DELETE SET NULL;
 
--- WINDOWS: columnas del modelo por si faltaran
+-- columnas del modelo por si faltaran
 ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS pred_label  TEXT,
   ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
@@ -271,8 +271,8 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# STOP: actualizar la última fila (id MAX) de ese session_id y poner reason='finish'
-END_LAST_OF_SESSION_SQL = """
+# STOP (sin end_ts): marcar reason='finish' en la ÚLTIMA fila (id MAX) de ese session_id
+END_LAST_OF_SESSION_NO_ENDTS_SQL = """
 WITH last_row AS (
   SELECT id
   FROM intervalos_label
@@ -281,11 +281,10 @@ WITH last_row AS (
   LIMIT 1
 )
 UPDATE intervalos_label il
-SET end_ts = $2,
-    reason = 'finish'
+SET reason = 'finish'
 FROM last_row
 WHERE il.id = last_row.id
-RETURNING il.id, il.end_ts, il.reason;
+RETURNING il.id, il.reason;
 """
 
 # Leer reason/label/duracion de la ÚLTIMA fila (id MAX) para un session_id
@@ -313,6 +312,14 @@ SET label = $2,
 FROM last_row
 WHERE il.id = last_row.id
 RETURNING il.id, il.label, il.duracion, il.reason;
+"""
+
+# Etiquetar ventanas de los últimos N segundos para ese session_id
+UPDATE_WINDOWS_LABEL_LAST_SECONDS_SQL = """
+UPDATE windows
+SET etiqueta = $2
+WHERE session_id = $1
+  AND end_time >= (NOW() AT TIME ZONE 'UTC') - ($3::int || ' seconds')::interval;
 """
 
 WINDOWS_INSERT_SQL = """
@@ -425,9 +432,8 @@ def _normi(v):
     except Exception:
         return None
 
-# ---------- Notificación al modelo (solo envío de id, sin deps) ----------
+# ---------- Notificación al modelo ----------
 def _post_predict_sync(win_id: int):
-    """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
     data = json.dumps({"id": win_id}).encode("utf-8")
     req = urllib.request.Request(
         PREDICT_URL,
@@ -453,7 +459,6 @@ def _post_predict_sync(win_id: int):
         print(f"💥 Error notificando al modelo: {e}")
 
 async def notify_model(win_id: int):
-    """Envía el id en background sin bloquear el event loop."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _post_predict_sync, win_id)
 
@@ -468,17 +473,10 @@ async def register_user(conn: asyncpg.Connection, email: str, display_name: Opti
     row = await conn.fetchrow(GET_USER_BY_EMAIL_SQL, email)
     if row and row["password_hash"]:
         return {"ok": False, "code": "email_exists", "message": "El correo ya está registrado"}
-
     pwd_hash = PH.hash(password)
     row = await conn.fetchrow(INSERT_USER_RETURNING_SQL, email, display_name, bday, pwd_hash)
     print(f"✅ register_user OK id={row['id_usuario']}")
-    return {
-        "ok": True,
-        "id_usuario": row["id_usuario"],
-        "email": row["email"],
-        "display_name": row["display_name"],
-        "birthday": birthday_str
-    }
+    return {"ok": True, "id_usuario": row["id_usuario"], "email": row["email"], "display_name": row["display_name"], "birthday": birthday_str}
 
 async def login_user(conn: asyncpg.Connection, email: str, password: str):
     print(f"🔐 login_user: email={email}")
@@ -493,12 +491,7 @@ async def login_user(conn: asyncpg.Connection, email: str, password: str):
         return {"ok": False, "code": "invalid_credentials", "message": "Credenciales inválidas"}
     await conn.execute("UPDATE users SET last_seen_at = NOW() WHERE id_usuario = $1", row["id_usuario"])
     print(f"✅ login_user OK id={row['id_usuario']}")
-    return {
-        "ok": True,
-        "id_usuario": row["id_usuario"],
-        "email": email,
-        "display_name": row["display_name"]
-    }
+    return {"ok": True, "id_usuario": row["id_usuario"], "email": email, "display_name": row["display_name"]}
 
 async def change_password(conn: asyncpg.Connection, user_id: int, old_pwd: str, new_pwd: str):
     print(f"🛠 change_password: id={user_id}")
@@ -526,29 +519,28 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
 
     row = await conn.fetchrow(
         INSERT_INTERVAL_WITH_ID_SQL,
-        new_id,
+        new_id,  # id
         user_id,
         label.strip(),
         (reason or "").strip() or None,
         now
     )
 
-    # id == session_id en el momento de creación
+    # id == session_id
     return {
         "ok": True,
-        "interval_id": row["session_id"],  # devolvemos el session_id (que == id)
+        "interval_id": row["session_id"],
         "session_id": row["session_id"],
         "label": row["label"],
         "start_ts": row["start_ts"].isoformat()
     }
 
 async def stop_session(conn: asyncpg.Connection, session_id: int):
-    # aquí 'session_id' es el valor que recibimos en "interval_id" del cliente
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    row = await conn.fetchrow(END_LAST_OF_SESSION_SQL, session_id, now)
+    # sin end_ts, solo reason='finish' en la última fila de ese session_id
+    row = await conn.fetchrow(END_LAST_OF_SESSION_NO_ENDTS_SQL, session_id)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada para ese session_id"}
-    return {"ok": True, "interval_id": session_id, "end_ts": now.isoformat(), "reason": row["reason"]}
+    return {"ok": True, "interval_id": session_id, "reason": row["reason"]}
 
 # ---------- DB init ----------
 async def init_db():
@@ -624,7 +616,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
 
-    # Lanza notificación al modelo en background (solo id)
+    # notificar al modelo en background (solo id)
     asyncio.create_task(notify_model(win_id))
 
     return win_id
@@ -679,7 +671,7 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "stop_session":
-                            # El cliente manda "interval_id": lo interpretamos como session_id
+                            # El cliente manda "interval_id" pero lo usamos como session_id
                             try:
                                 sess = int(data.get("interval_id"))
                             except Exception:
@@ -688,7 +680,7 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "get_interval_reason":
-                            # El cliente manda "interval_id": lo interpretamos como session_id
+                            # El cliente manda "interval_id" pero lo usamos como session_id
                             try:
                                 sess = int(data.get("interval_id"))
                             except Exception:
@@ -705,14 +697,14 @@ async def handle_connection(websocket):
                                 r = None
                             await websocket.send(json.dumps({
                                 "ok": True,
-                                "interval_id": sess,   # seguimos devolviendo el session_id
+                                "interval_id": sess,
                                 "reason": r,
                                 "label": row["label"],
                                 "duracion": row["duracion"]
                             })); continue
 
                         elif typ == "apply_interval_feedback":
-                            # El cliente manda "interval_id": lo interpretamos como session_id
+                            # El cliente manda "interval_id" pero lo usamos como session_id
                             try:
                                 sess = int(data.get("interval_id"))
                             except Exception:
@@ -724,9 +716,15 @@ async def handle_connection(websocket):
                                 dur = 0
                             if not new_label:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_label", "message": "Actividad requerida"})); continue
+
+                            # 1) Actualiza la última fila del intervalo
                             row = await conn.fetchrow(APPLY_FEEDBACK_LAST_SQL, sess, new_label, dur)
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "No hay filas para ese session_id"})); continue
+
+                            # 2) Etiqueta ventanas recientes del mismo session_id en los últimos 'dur' segundos
+                            await conn.execute(UPDATE_WINDOWS_LABEL_LAST_SECONDS_SQL, sess, new_label, dur)
+
                             await websocket.send(json.dumps({
                                 "ok": True,
                                 "interval_id": sess,
@@ -748,7 +746,7 @@ async def handle_connection(websocket):
                         pass
                     continue
 
-            # Ventanas (array o objeto)
+            # Ventanas (array u objeto)
             items = data if isinstance(data, list) else [data]
             acks = []
             for item in items:
