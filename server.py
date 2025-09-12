@@ -10,6 +10,7 @@ from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+
 # --- stdlib HTTP (sin dependencias) ---
 import urllib.request
 import urllib.error
@@ -22,6 +23,7 @@ PH = PasswordHasher()
 # ---------- Config modelo ----------
 PREDICT_BASE = "https://online-server-xgji.onrender.com"
 PREDICT_URL = f"{PREDICT_BASE}/predict_by_window"
+POLICY_LABELED_URL = f"{PREDICT_BASE}/policy/labeled"
 HTTP_TIMEOUT_SECS = 6  # timeout corto para no bloquear
 
 # ---------- Cache en memoria de etiqueta vigente por sesión ----------
@@ -41,7 +43,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
-#-- -- ATENCIÓN: session_id YA NO ES UNIQUE
+# -- ATENCIÓN: session_id YA NO ES UNIQUE
 CREATE_INTERVALS_SQL = """
 CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
@@ -318,6 +320,15 @@ WHERE id = (
 RETURNING id, session_id, label, duracion, reason
 """
 
+# Para obtener id_usuario del último registro de ese session_id (para notificar policy)
+GET_USER_FOR_SESSION_SQL = """
+SELECT id_usuario
+FROM intervalos_label
+WHERE session_id = $1
+ORDER BY id DESC
+LIMIT 1
+"""
+
 # Backfill de ventanas por duración hacia atrás desde "ahora" (UTC)
 WINDOWS_BACKFILL_SQL = """
 UPDATE windows
@@ -436,7 +447,7 @@ def _normi(v):
     except Exception:
         return None
 
-# ---------- Notificación al modelo (solo envío de id, sin deps) ----------
+# ---------- Notificaciones HTTP (sin deps) ----------
 def _post_predict_sync(win_id: int):
     """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
     data = json.dumps({"id": win_id}).encode("utf-8")
@@ -468,6 +479,28 @@ async def notify_model(win_id: int):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _post_predict_sync, win_id)
 
+def _post_policy_labeled_sync(uid: int, session_id: int, when_dt: Optional[datetime]):
+    """Notifica al motor de reglas que el usuario etiquetó (o arrancó)."""
+    payload = {"id_usuario": uid, "session_id": session_id}
+    if when_dt is not None:
+        payload["when"] = when_dt.astimezone(timezone.utc).isoformat()
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        POLICY_LABELED_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
+            _ = resp.read()
+    except Exception as e:
+        print(f"⚠️ Error notificando policy/labeled: {e}")
+
+async def notify_policy_labeled(uid: int, session_id: int, when_dt: Optional[datetime] = None):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _post_policy_labeled_sync, uid, session_id, when_dt)
+
 # ---------- Helpers de etiqueta vigente ----------
 async def _db_fetch_latest_label_for_session(conn: asyncpg.Connection, session_id: int) -> Optional[str]:
     row = await conn.fetchrow("""
@@ -492,10 +525,7 @@ async def _get_current_label(session_id: int) -> Optional[str]:
         return lab
 
 async def _resolve_session_id(conn: asyncpg.Connection, maybe_interval_id: Optional[int], maybe_session_id: Optional[int]) -> Optional[int]:
-    """
-    Si recibimos session_id directamente, úsalo.
-    Si recibimos interval_id, buscamos su session_id.
-    """
+    """Si recibimos session_id directamente, úsalo. Si recibimos interval_id, buscamos su session_id."""
     if maybe_session_id is not None:
         return maybe_session_id
     if maybe_interval_id is not None:
@@ -582,10 +612,15 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
     # cachear etiqueta vigente para este session_id
     SESSION_ACTIVITY[row["session_id"]] = row["label"]
 
+    # 🔔 Notificar al motor de políticas que hay etiqueta inicial
+    asyncio.create_task(
+        notify_policy_labeled(user_id, row["session_id"], row["start_ts"])
+    )
+
     return {
         "ok": True,
-        "interval_id": row["id"],       # id de esta fila
-        "session_id": row["session_id"],# grupo (puede tener varias filas a futuro)
+        "interval_id": row["id"],        # id de esta fila
+        "session_id": row["session_id"], # grupo (puede tener varias filas a futuro)
         "label": row["label"],
         "start_ts": row["start_ts"].isoformat()
     }
@@ -696,7 +731,7 @@ async def handle_connection(websocket):
                 try:
                     async with POOL.acquire() as conn:
                         if typ == "register":
-                            _email = (data.get("email") or "").trim() if hasattr((data.get("email") or ""), "trim") else (data.get("email") or "").strip()
+                            _email = (data.get("email") or "").strip()
                             _name  = (data.get("display_name") or "").strip() or None
                             _bday  = (data.get("birthday") or "").strip() or None
                             _pwd   = (data.get("password") or "")
@@ -812,6 +847,16 @@ async def handle_connection(websocket):
 
                             # 3) Actualiza etiqueta vigente en cache para futuras ventanas
                             SESSION_ACTIVITY[sid] = new_label
+
+                            # 4) 🔔 Notificar al motor de políticas que el usuario etiquetó ahora
+                            try:
+                                uid_for_policy = await conn.fetchval(GET_USER_FOR_SESSION_SQL, sid)
+                                if uid_for_policy:
+                                    asyncio.create_task(
+                                        notify_policy_labeled(int(uid_for_policy), sid, datetime.utcnow().replace(tzinfo=timezone.utc))
+                                    )
+                            except Exception as e:
+                                print(f"⚠️ policy/labeled tras feedback falló: {e}")
 
                             await websocket.send(json.dumps({
                                 "ok": True,
