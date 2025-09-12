@@ -95,7 +95,9 @@ CREATE TABLE IF NOT EXISTS windows (
   pitch_mean       DOUBLE PRECISION, pitch_std DOUBLE PRECISION, pitch_min DOUBLE PRECISION, pitch_max DOUBLE PRECISION, pitch_range DOUBLE PRECISION,
   roll_mean        DOUBLE PRECISION, roll_std DOUBLE PRECISION, roll_min DOUBLE PRECISION, roll_max DOUBLE PRECISION, roll_range DOUBLE PRECISION,
 
-  acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION
+  acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION,
+
+  sl_trained       BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
@@ -105,7 +107,7 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA: elimina UNIQUE en session_id y asegura índices/FKs
+# MIGRACIÓN DEFENSIVA: elimina UNIQUE en session_id y asegura índices/FKs y nueva columna
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -258,7 +260,8 @@ ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS pred_label  TEXT,
   ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS precision   DOUBLE PRECISION,
-  ADD COLUMN IF NOT EXISTS actividad   TEXT;
+  ADD COLUMN IF NOT EXISTS actividad   TEXT,
+  ADD COLUMN IF NOT EXISTS sl_trained  BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
