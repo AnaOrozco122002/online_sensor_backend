@@ -450,6 +450,32 @@ def _normi(v):
     except Exception:
         return None
 
+# ===== NUEVO: helpers de modo / etiquetas nulas =====
+def _is_nullish(v) -> bool:
+    if v is None: return True
+    s = str(v).strip().lower()
+    return s in ("", "null", "none", "na", "sin prediccion")
+
+def _mode_with_null(labels):
+    """Devuelve (winner_or_None, counts_dict_including_None).
+    Empate: se prefiere una etiqueta NO nula."""
+    counts = {}
+    for lab in labels:
+        key = None if _is_nullish(lab) else str(lab).strip()
+        counts[key] = counts.get(key, 0) + 1
+
+    if not counts:
+        return None, {}
+
+    winner, maxc = None, -1
+    for k, c in counts.items():
+        if c > maxc:
+            winner, maxc = k, c
+        elif c == maxc:
+            if winner is None and k is not None:
+                winner = k
+    return winner, counts
+
 # ---------- Notificaciones HTTP (sin deps) ----------
 def _post_predict_sync(win_id: int):
     """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
@@ -869,6 +895,60 @@ async def handle_connection(websocket):
                                 "duracion": row["duracion"],
                                 "reason": row["reason"]
                             })); continue
+
+                        # ===== NUEVO RPC: modo (actividad más frecuente) en 10 s =====
+                        elif typ == "get_predictions_mode":
+                            # Params: session_id (o interval_id), horizon_sec (opcional, default 10)
+                            session_id = data.get("session_id")
+                            interval_id = data.get("interval_id")
+                            try:
+                                session_id = int(session_id) if session_id is not None else None
+                            except Exception:
+                                session_id = None
+                            try:
+                                interval_id = int(interval_id) if interval_id is not None else None
+                            except Exception:
+                                interval_id = None
+
+                            sid = await _resolve_session_id(conn, interval_id, session_id)
+                            if sid is None:
+                                await websocket.send(json.dumps({"ok": False, "code": "bad_session", "message": "No se pudo resolver session_id"})); continue
+
+                            try:
+                                horizon = int(data.get("horizon_sec", 10))
+                            except Exception:
+                                horizon = 10
+                            if horizon < 1: horizon = 1
+                            if horizon > 120: horizon = 120
+
+                            rows = await conn.fetch("""
+                                SELECT pred_label, actividad
+                                  FROM windows
+                                 WHERE session_id = $1
+                                   AND end_time >= (NOW() AT TIME ZONE 'UTC') - ($2::int * INTERVAL '1 second')
+                                   AND end_time <= (NOW() AT TIME ZONE 'UTC')
+                                 ORDER BY end_time DESC
+                            """, sid, horizon)
+
+                            pre_labels = [r["pred_label"] for r in rows]
+                            sl_labels  = [r["actividad"]  for r in rows]
+
+                            pre_mode, pre_counts = _mode_with_null(pre_labels)
+                            sl_mode,  sl_counts  = _mode_with_null(sl_labels)
+
+                            resp = {
+                                "ok": True,
+                                "session_id": sid,
+                                "horizon_sec": horizon,
+                                "pred_label_mode": pre_mode,   # puede ser None
+                                "actividad_mode":  sl_mode,    # puede ser None
+                                "counts": {
+                                    "pred_label": { ("" if k is None else k): v for k, v in pre_counts.items() },
+                                    "actividad":  { ("" if k is None else k): v for k, v in sl_counts.items() },
+                                },
+                                "windows_considered": len(rows),
+                            }
+                            await websocket.send(json.dumps(resp, ensure_ascii=False)); continue
 
                         elif typ == "ping":
                             await websocket.send(json.dumps({"ok": True, "type": "pong"})); continue
