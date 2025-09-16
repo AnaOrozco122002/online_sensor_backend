@@ -308,19 +308,20 @@ WHERE id = (
 RETURNING id, session_id, reason
 """
 
-# Actualiza label/duracion/razón en la última fila por session_id
+# ✅ ACTUALIZADO: al aplicar feedback también seteamos end_ts = $4 (UTC del momento de respuesta)
 APPLY_FEEDBACK_BY_SESSION_SQL = """
 UPDATE intervalos_label
 SET label   = $2,
     duracion = $3,
-    reason  = 'ok'
+    reason  = 'ok',
+    end_ts  = $4
 WHERE id = (
   SELECT id FROM intervalos_label
   WHERE session_id = $1
   ORDER BY id DESC
   LIMIT 1
 )
-RETURNING id, session_id, label, duracion, reason
+RETURNING id, session_id, label, duracion, reason, end_ts
 """
 
 # Para obtener id_usuario del último registro de ese session_id (para notificar policy)
@@ -676,7 +677,6 @@ async def init_db():
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
 
 # ---------- Save window ----------
-# ---------- Save window ----------
 async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -699,8 +699,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
 
-    # ❗️CAMBIO: NO escribir 'etiqueta' en windows hasta confirmación del usuario.
-    # (Antes: leíamos la 'etiqueta vigente' desde SESSION_ACTIVITY; ahora la forzamos a None)
+    # ❗️NO escribir 'etiqueta' en windows hasta confirmación del usuario.
     etiqueta = None
 
     pred_label   = None
@@ -715,7 +714,7 @@ async def save_window(item: Dict[str, Any]) -> int:
         received_at, start_time, end_time, sample_count, sample_rate,
         json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
-        start_index, end_index, n_muestras, etiqueta,   # <- etiqueta = None
+        start_index, end_index, n_muestras, etiqueta,
 
         pred_label, confianza, precision, actividad,
 
@@ -864,7 +863,10 @@ async def handle_connection(websocket):
                             if sid is None:
                                 await websocket.send(json.dumps({"ok": False, "code": "bad_session", "message": "No se pudo resolver session_id"})); continue
 
-                            row = await conn.fetchrow(APPLY_FEEDBACK_BY_SESSION_SQL, sid, new_label, dur)
+                            # ✅ end_ts = "momento en el que se respondió" en UTC (+00)
+                            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+                            row = await conn.fetchrow(APPLY_FEEDBACK_BY_SESSION_SQL, sid, new_label, dur, now_utc)  # ✅ pasa end_ts
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
 
@@ -882,7 +884,7 @@ async def handle_connection(websocket):
                                 uid_for_policy = await conn.fetchval(GET_USER_FOR_SESSION_SQL, sid)
                                 if uid_for_policy:
                                     asyncio.create_task(
-                                        notify_policy_labeled(int(uid_for_policy), sid, datetime.utcnow().replace(tzinfo=timezone.utc))
+                                        notify_policy_labeled(int(uid_for_policy), sid, now_utc)
                                     )
                             except Exception as e:
                                 print(f"⚠️ policy/labeled tras feedback falló: {e}")
@@ -893,7 +895,8 @@ async def handle_connection(websocket):
                                 "session_id": row["session_id"],
                                 "label": row["label"],
                                 "duracion": row["duracion"],
-                                "reason": row["reason"]
+                                "reason": row["reason"],
+                                "end_ts": row["end_ts"].isoformat() if row["end_ts"] else now_utc.isoformat(),  # útil para el cliente
                             })); continue
 
                         # ===== NUEVO RPC: modo (actividad más frecuente) en 10 s =====
