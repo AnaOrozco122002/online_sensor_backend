@@ -676,6 +676,7 @@ async def init_db():
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
 
 # ---------- Save window ----------
+# ---------- Save window ----------
 async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -698,11 +699,9 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
 
-    # etiqueta vigente (SERVIDOR impone)
-    etiqueta_vigente = None
-    if interval_id is not None:
-        etiqueta_vigente = await _get_current_label(interval_id)
-    etiqueta = etiqueta_vigente
+    # ❗️CAMBIO: NO escribir 'etiqueta' en windows hasta confirmación del usuario.
+    # (Antes: leíamos la 'etiqueta vigente' desde SESSION_ACTIVITY; ahora la forzamos a None)
+    etiqueta = None
 
     pred_label   = None
     confianza    = None
@@ -716,7 +715,7 @@ async def save_window(item: Dict[str, Any]) -> int:
         received_at, start_time, end_time, sample_count, sample_rate,
         json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
-        start_index, end_index, n_muestras, etiqueta,
+        start_index, end_index, n_muestras, etiqueta,   # <- etiqueta = None
 
         pred_label, confianza, precision, actividad,
 
@@ -741,6 +740,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     asyncio.create_task(notify_model(win_id))
 
     return win_id
+
 
 # ---------- WS ----------
 async def handle_connection(websocket):
