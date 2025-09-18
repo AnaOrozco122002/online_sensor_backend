@@ -677,7 +677,6 @@ async def init_db():
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
 
 # ---------- Save window ----------
-# ---------- Save window ----------
 async def save_window(item: Dict[str, Any]) -> int:
     assert POOL is not None
     received_at = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -700,9 +699,29 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
 
-    # ❗️CAMBIO: NO escribir 'etiqueta' en windows hasta confirmación del usuario.
-    # (Antes: leíamos la 'etiqueta vigente' desde SESSION_ACTIVITY; ahora la forzamos a None)
+    # ===== NUEVO: Etiquetar SOLO las primeras 10 ventanas de este interval_id =====
     etiqueta = None
+    if interval_id is not None:
+        async with POOL.acquire() as conn_cnt:
+            try:
+                cnt = await conn_cnt.fetchval(
+                    "SELECT COUNT(*) FROM windows WHERE session_id = $1",
+                    interval_id
+                )
+                if cnt is not None and int(cnt) < 10:
+                    # tomar la etiqueta vigente (última por este session_id)
+                    etiqueta_row = await conn_cnt.fetchrow("""
+                        SELECT label
+                          FROM intervalos_label
+                         WHERE session_id = $1
+                         ORDER BY id DESC
+                         LIMIT 1
+                    """, interval_id)
+                    if etiqueta_row and etiqueta_row["label"]:
+                        etiqueta = etiqueta_row["label"]
+            except Exception as _e:
+                # si algo falla, seguimos como None para no romper el flujo
+                etiqueta = None
 
     pred_label   = None
     confianza    = None
@@ -716,7 +735,7 @@ async def save_window(item: Dict[str, Any]) -> int:
         received_at, start_time, end_time, sample_count, sample_rate,
         json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
-        start_index, end_index, n_muestras, etiqueta,   # <- etiqueta = None
+        start_index, end_index, n_muestras, etiqueta,   # <- etiqueta calculada arriba
 
         pred_label, confianza, precision, actividad,
 
