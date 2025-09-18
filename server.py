@@ -15,6 +15,13 @@ from argon2.exceptions import VerifyMismatchError
 import urllib.request
 import urllib.error
 
+# === SL trainer (cron) deps ===
+import random
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 POOL: asyncpg.Pool | None = None
@@ -25,6 +32,12 @@ PREDICT_BASE = "https://online-server-xgji.onrender.com"
 PREDICT_URL = f"{PREDICT_BASE}/predict_by_window"
 POLICY_LABELED_URL = f"{PREDICT_BASE}/policy/labeled"
 HTTP_TIMEOUT_SECS = 6  # timeout corto para no bloquear
+
+# === Entrenador periódico de SL (configurable por ENV) ===
+SL_TRAIN_URL         = os.getenv("SL_TRAIN_URL", f"{PREDICT_BASE}/sl_train_pending")
+SL_TRAIN_POLL_SECS   = int(os.getenv("SL_TRAIN_POLL_SECS", "60"))   # cada 60s
+SL_TRAIN_LIMIT       = int(os.getenv("SL_TRAIN_LIMIT", "500"))      # batch size
+SL_TRAIN_CRON_ENABLE = os.getenv("SL_TRAIN_CRON_ENABLED", "1") == "1"
 
 # ---------- Cache en memoria de etiqueta vigente por sesión ----------
 # Clave: session_id (grupo)  Valor: str (label vigente)
@@ -699,29 +712,8 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
 
-    # ===== NUEVO: Etiquetar SOLO las primeras 10 ventanas de este interval_id =====
+    # ❗️Actualmente: NO escribimos 'etiqueta' en windows (se backfillea tras confirmación).
     etiqueta = None
-    if interval_id is not None:
-        async with POOL.acquire() as conn_cnt:
-            try:
-                cnt = await conn_cnt.fetchval(
-                    "SELECT COUNT(*) FROM windows WHERE session_id = $1",
-                    interval_id
-                )
-                if cnt is not None and int(cnt) < 10:
-                    # tomar la etiqueta vigente (última por este session_id)
-                    etiqueta_row = await conn_cnt.fetchrow("""
-                        SELECT label
-                          FROM intervalos_label
-                         WHERE session_id = $1
-                         ORDER BY id DESC
-                         LIMIT 1
-                    """, interval_id)
-                    if etiqueta_row and etiqueta_row["label"]:
-                        etiqueta = etiqueta_row["label"]
-            except Exception as _e:
-                # si algo falla, seguimos como None para no romper el flujo
-                etiqueta = None
 
     pred_label   = None
     confianza    = None
@@ -735,7 +727,7 @@ async def save_window(item: Dict[str, Any]) -> int:
         received_at, start_time, end_time, sample_count, sample_rate,
         json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
-        start_index, end_index, n_muestras, etiqueta,   # <- etiqueta calculada arriba
+        start_index, end_index, n_muestras, etiqueta,
 
         pred_label, confianza, precision, actividad,
 
@@ -1011,9 +1003,46 @@ async def handle_connection(websocket):
     except Exception as e:
         print(f"⚠️ Error en la conexión: {e}")
 
+# ---------- SL trainer loop ----------
+async def sl_trainer_loop():
+    """Llama periódicamente a /sl_train_pending en background (no bloquea el WS)."""
+    if aiohttp is None:
+        print("⚠️  aiohttp no está instalado; SL trainer deshabilitado.")
+        return
+
+    # pequeño delay para que el server arranque
+    await asyncio.sleep(5)
+
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                if SL_TRAIN_CRON_ENABLE:
+                    payload = {"limit": SL_TRAIN_LIMIT}
+                    async with session.post(SL_TRAIN_URL, json=payload) as resp:
+                        _ = await resp.text()  # consumir respuesta (libera conexión)
+                        # print(f"[SL_TRAIN] {resp.status} {_[:120]}")
+            except Exception:
+                # log opcional
+                pass
+
+            # jitter para evitar sincronías entre instancias
+            delay = SL_TRAIN_POLL_SECS + random.uniform(-5, 5)
+            if delay < 5:
+                delay = 5
+            await asyncio.sleep(delay)
+
 # ---------- Main ----------
 async def main():
     await init_db()
+
+    # Lanzar el cron de entrenamiento SL en background (si está habilitado)
+    if SL_TRAIN_CRON_ENABLE:
+        if aiohttp is None:
+            print("⚠️  SL_TRAIN_CRON_ENABLED=1 pero falta aiohttp; instala 'aiohttp' para habilitar el cron.")
+        else:
+            asyncio.create_task(sl_trainer_loop())
+
     print(f"🌐 Iniciando WebSocket en 0.0.0.0:{PORT} ...")
     async with websockets.serve(handle_connection, "0.0.0.0", PORT, ping_interval=30, ping_timeout=30):
         print(f"🚀 WS server escuchando en puerto {PORT}")
