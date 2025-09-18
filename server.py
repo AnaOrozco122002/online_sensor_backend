@@ -314,6 +314,7 @@ UPDATE intervalos_label
 SET label   = $2,
     duracion = $3,
     reason  = 'ok'
+    created_at = NOW()
 WHERE id = (
   SELECT id FROM intervalos_label
   WHERE session_id = $1
