@@ -313,7 +313,7 @@ APPLY_FEEDBACK_BY_SESSION_SQL = """
 UPDATE intervalos_label
 SET label   = $2,
     duracion = $3,
-    reason  = 'ok'
+    reason  = 'ok',
     created_at = NOW()
 WHERE id = (
   SELECT id FROM intervalos_label
