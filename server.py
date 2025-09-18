@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS intervalos_label (
   label       TEXT NOT NULL,
   reason      TEXT,
   duracion    INTEGER,
-  start_ts    TIMESTAMPTZ NOT NULL,
+  start_ts    TIMESTAMPTZ,
   end_ts      TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
