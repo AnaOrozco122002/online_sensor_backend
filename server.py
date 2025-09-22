@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS intervalos_label (
   id          BIGSERIAL PRIMARY KEY,
   session_id  BIGINT NOT NULL,
   id_usuario  BIGINT REFERENCES users(id_usuario),
-  label       TEXT NOT NULL,
+  label       TEXT,
   reason      TEXT,
   duracion    INTEGER,
   start_ts    TIMESTAMPTZ,
