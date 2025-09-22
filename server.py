@@ -44,6 +44,10 @@ SL_TRAIN_CRON_ENABLE = os.getenv("SL_TRAIN_CRON_ENABLED", "1") == "1"
 # Clave: session_id (grupo)  Valor: str (label vigente)
 SESSION_ACTIVITY: Dict[int, str] = {}
 
+# ---------- Bootstrap de primeras N ventanas con etiqueta inicial ----------
+# Clave: session_id (grupo)  Valor: ventanas restantes por forzar etiqueta inicial
+SESSION_BOOTSTRAP: Dict[int, int] = {}
+
 # ---------- Telemetría simple en memoria ----------
 METRICS = {
     "predict_ok": 0,
@@ -312,7 +316,7 @@ VALUES ($1, $1, $2, $3, $4, $5)
 RETURNING id, session_id, label, reason, start_ts
 """
 
-# --- Consultas auxiliares para "última fila por session_id" ---
+# --- Consultas auxiliares ---
 GET_SESSION_ID_BY_INTERVAL_ID_SQL = """
 SELECT session_id FROM intervalos_label WHERE id = $1
 """
@@ -321,6 +325,16 @@ GET_LATEST_INTERVAL_FOR_SESSION_SQL = """
 SELECT id, session_id, reason, label, duracion
 FROM intervalos_label
 WHERE session_id = $1
+ORDER BY id DESC
+LIMIT 1
+"""
+
+# Fila inicial de la sesión (reason='initial')
+GET_INITIAL_ROW_FOR_SESSION_SQL = """
+SELECT label
+FROM intervalos_label
+WHERE session_id = $1
+  AND reason = 'initial'
 ORDER BY id DESC
 LIMIT 1
 """
@@ -536,21 +550,18 @@ def _post_predict_sync(win_id: int):
                         METRICS["predict_retry"] += 1
                         delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
                         delay += random.uniform(0, 0.4)
-                        # print(f"[predict] {code} retry in {delay:.2f}s (dt={dt:.0f}ms)")
                         time.sleep(delay)
                         continue
                     METRICS["predict_fail"] += 1
                     print(f"⚠️ Modelo respondió {code} tras {attempt} intentos (dt={dt:.0f}ms). {_metrics_dump()}")
                 else:
                     METRICS["predict_ok"] += 1
-                    # print(f"[predict ok] {code} (dt={dt:.0f}ms) {_metrics_dump()}")
                 return
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
             if attempt < max_attempts:
                 METRICS["predict_retry"] += 1
                 delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
                 delay += random.uniform(0, 0.6)
-                # print(f"[predict net err] {e} retry in {delay:.2f}s")
                 time.sleep(delay)
                 continue
             METRICS["predict_fail"] += 1
@@ -598,14 +609,12 @@ def _post_policy_labeled_sync(uid: int, session_id: int, when_dt: Optional[datet
                 _ = resp.read()
                 dt = (time.time() - t0) * 1000
                 METRICS["policy_ok"] += 1
-                # print(f"[policy ok] (dt={dt:.0f}ms) {_metrics_dump()}")
                 return
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
             if attempt < max_attempts:
                 METRICS["policy_retry"] += 1
                 delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
                 delay += random.uniform(0, 0.5)
-                # print(f"[policy net err] {e} retry in {delay:.2f}s")
                 time.sleep(delay)
                 continue
             METRICS["policy_fail"] += 1
@@ -730,12 +739,14 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         new_id,
         user_id,
         label.strip(),
-        (reason or "").strip() or None,
+        (reason or "").strip() or 'initial',  # aseguramos initial por defecto
         now
     )
 
     # cachear etiqueta vigente para este session_id
     SESSION_ACTIVITY[row["session_id"]] = row["label"]
+    # inicializar bootstrap de primeras 10 ventanas
+    SESSION_BOOTSTRAP[row["session_id"]] = 10
 
     # 🔔 Notificar al motor de políticas que hay etiqueta inicial
     asyncio.create_task(
@@ -755,6 +766,8 @@ async def stop_session_by_session(conn: asyncpg.Connection, session_id: int):
     row = await conn.fetchrow(STOP_BY_SESSION_SQL, session_id)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
+    # al finalizar sesión, por seguridad ponemos bootstrap a 0
+    SESSION_BOOTSTRAP[session_id] = 0
     return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "reason": row["reason"]}
 
 # ---------- DB init ----------
@@ -794,8 +807,28 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
 
-    # ❗️Actualmente: NO escribimos 'etiqueta' en windows (se backfillea tras confirmación).
-    etiqueta = None
+    # 1) si el cliente manda etiqueta válida, se respeta
+    etiqueta: Optional[str] = None
+    try:
+        lab_raw = item.get("etiqueta")
+        if lab_raw is not None:
+            s = str(lab_raw).strip()
+            if s and s.lower() not in ("null", "none", "na", "sin prediccion"):
+                etiqueta = s
+    except Exception:
+        etiqueta = None
+
+    # 2) si NO vino etiqueta y aún quedan N ventanas por bootstrap,
+    #    tomamos la etiqueta inicial de intervalos_label (reason='initial')
+    if etiqueta is None and interval_id is not None:
+        remaining = SESSION_BOOTSTRAP.get(interval_id, 0)
+        if remaining > 0:
+            async with POOL.acquire() as conn:
+                row = await conn.fetchrow(GET_INITIAL_ROW_FOR_SESSION_SQL, interval_id)
+            if row and row["label"]:
+                etiqueta = str(row["label"]).strip() or None
+            # decrementamos siempre que se intentó forzar (tenga o no label válida)
+            SESSION_BOOTSTRAP[interval_id] = max(0, remaining - 1)
 
     pred_label   = None
     confianza    = None
@@ -1103,9 +1136,7 @@ async def sl_trainer_loop():
                     payload = {"limit": SL_TRAIN_LIMIT}
                     async with session.post(SL_TRAIN_URL, json=payload) as resp:
                         _ = await resp.text()  # consumir respuesta (libera conexión)
-                        # print(f"[SL_TRAIN] {resp.status} {_[:120]}")
             except Exception:
-                # log opcional
                 pass
 
             # jitter para evitar sincronías entre instancias
