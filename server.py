@@ -3,6 +3,7 @@ import os
 import re
 import json
 import math
+import time
 import asyncio
 import asyncpg
 import websockets
@@ -31,7 +32,7 @@ PH = PasswordHasher()
 PREDICT_BASE = "https://online-server-xgji.onrender.com"
 PREDICT_URL = f"{PREDICT_BASE}/predict_by_window"
 POLICY_LABELED_URL = f"{PREDICT_BASE}/policy/labeled"
-HTTP_TIMEOUT_SECS = 6  # timeout corto para no bloquear
+HTTP_TIMEOUT_SECS = 12  # timeout más holgado
 
 # === Entrenador periódico de SL (configurable por ENV) ===
 SL_TRAIN_URL         = os.getenv("SL_TRAIN_URL", f"{PREDICT_BASE}/sl_train_pending")
@@ -42,6 +43,22 @@ SL_TRAIN_CRON_ENABLE = os.getenv("SL_TRAIN_CRON_ENABLED", "1") == "1"
 # ---------- Cache en memoria de etiqueta vigente por sesión ----------
 # Clave: session_id (grupo)  Valor: str (label vigente)
 SESSION_ACTIVITY: Dict[int, str] = {}
+
+# ---------- Telemetría simple en memoria ----------
+METRICS = {
+    "predict_ok": 0,
+    "predict_retry": 0,
+    "predict_fail": 0,
+    "policy_ok": 0,
+    "policy_retry": 0,
+    "policy_fail": 0,
+}
+
+def _metrics_dump():
+    return (f"[metrics] predict_ok={METRICS['predict_ok']} "
+            f"retry={METRICS['predict_retry']} fail={METRICS['predict_fail']} | "
+            f"policy_ok={METRICS['policy_ok']} retry={METRICS['policy_retry']} "
+            f"fail={METRICS['policy_fail']}")
 
 # ---------- SQL ----------
 CREATE_USERS_SQL = """
@@ -490,32 +507,65 @@ def _mode_with_null(labels):
                 winner = k
     return winner, counts
 
-# ---------- Notificaciones HTTP (sin deps) ----------
+# ---------- Notificaciones HTTP con reintentos ----------
 def _post_predict_sync(win_id: int):
-    """Bloqueante: usa urllib.request para POSTear el id. Se ejecuta en hilo."""
+    """Bloqueante: POSTea el id al modelo con reintentos/backoff.
+    Se ejecuta en un hilo (run_in_executor), así que time.sleep no bloquea el loop."""
     data = json.dumps({"id": win_id}).encode("utf-8")
-    req = urllib.request.Request(
-        PREDICT_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
-            _ = resp.read()
-            code = resp.getcode()
-            if code != 200:
-                print(f"⚠️ Modelo respondió {code}")
-    except urllib.error.HTTPError as e:
+    attempt = 0
+    max_attempts = 4            # 1 intento inicial + 3 reintentos
+    backoff_base = 0.7          # segundos
+    backoff_cap = 6.0           # máximo entre intentos
+
+    while True:
+        attempt += 1
+        req = urllib.request.Request(
+            PREDICT_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         try:
-            body = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            body = ""
-        print(f"⚠️ Error HTTP al notificar modelo: {e.code} {body[:200]}")
-    except urllib.error.URLError as e:
-        print(f"⚠️ Error de red al notificar modelo: {e.reason}")
-    except Exception as e:
-        print(f"💥 Error notificando al modelo: {e}")
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
+                _ = resp.read()
+                code = resp.getcode()
+                dt = (time.time() - t0) * 1000
+                if code != 200:
+                    if attempt < max_attempts:
+                        METRICS["predict_retry"] += 1
+                        delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                        delay += random.uniform(0, 0.4)
+                        # print(f"[predict] {code} retry in {delay:.2f}s (dt={dt:.0f}ms)")
+                        time.sleep(delay)
+                        continue
+                    METRICS["predict_fail"] += 1
+                    print(f"⚠️ Modelo respondió {code} tras {attempt} intentos (dt={dt:.0f}ms). {_metrics_dump()}")
+                else:
+                    METRICS["predict_ok"] += 1
+                    # print(f"[predict ok] {code} (dt={dt:.0f}ms) {_metrics_dump()}")
+                return
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_attempts:
+                METRICS["predict_retry"] += 1
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                delay += random.uniform(0, 0.6)
+                # print(f"[predict net err] {e} retry in {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            METRICS["predict_fail"] += 1
+            print(f"⚠️ Error notificando al modelo tras {attempt} intentos: {e}. {_metrics_dump()}")
+            return
+        except Exception as e:
+            if attempt < max_attempts:
+                METRICS["predict_retry"] += 1
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                delay += random.uniform(0, 0.6)
+                time.sleep(delay)
+                continue
+            METRICS["predict_fail"] += 1
+            print(f"💥 Error notificando al modelo tras {attempt} intentos: {e}. {_metrics_dump()}")
+            return
 
 async def notify_model(win_id: int):
     """Envía el id en background sin bloquear el event loop."""
@@ -523,22 +573,54 @@ async def notify_model(win_id: int):
     await loop.run_in_executor(None, _post_predict_sync, win_id)
 
 def _post_policy_labeled_sync(uid: int, session_id: int, when_dt: Optional[datetime]):
-    """Notifica al motor de reglas que el usuario etiquetó (o arrancó)."""
+    """Notifica al motor de reglas que el usuario etiquetó/arrancó, con reintentos."""
     payload = {"id_usuario": uid, "session_id": session_id}
     if when_dt is not None:
         payload["when"] = when_dt.astimezone(timezone.utc).isoformat()
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        POLICY_LABELED_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
-            _ = resp.read()
-    except Exception as e:
-        print(f"⚠️ Error notificando policy/labeled: {e}")
+
+    attempt = 0
+    max_attempts = 4
+    backoff_base = 0.5
+    backoff_cap = 5.0
+
+    while True:
+        attempt += 1
+        req = urllib.request.Request(
+            POLICY_LABELED_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
+                _ = resp.read()
+                dt = (time.time() - t0) * 1000
+                METRICS["policy_ok"] += 1
+                # print(f"[policy ok] (dt={dt:.0f}ms) {_metrics_dump()}")
+                return
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_attempts:
+                METRICS["policy_retry"] += 1
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                delay += random.uniform(0, 0.5)
+                # print(f"[policy net err] {e} retry in {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            METRICS["policy_fail"] += 1
+            print(f"⚠️ policy/labeled falló tras {attempt} intentos: {e}. {_metrics_dump()}")
+            return
+        except Exception as e:
+            if attempt < max_attempts:
+                METRICS["policy_retry"] += 1
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                delay += random.uniform(0, 0.5)
+                time.sleep(delay)
+                continue
+            METRICS["policy_fail"] += 1
+            print(f"⚠️ policy/labeled error tras {attempt} intentos: {e}. {_metrics_dump()}")
+            return
 
 async def notify_policy_labeled(uid: int, session_id: int, when_dt: Optional[datetime] = None):
     loop = asyncio.get_running_loop()
@@ -662,8 +744,8 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
 
     return {
         "ok": True,
-        "interval_id": row["id"],        # id de esta fila
-        "session_id": row["session_id"], # grupo (puede tener varias filas a futuro)
+        "interval_id": row["id"],
+        "session_id": row["session_id"],
         "label": row["label"],
         "start_ts": row["start_ts"].isoformat()
     }
