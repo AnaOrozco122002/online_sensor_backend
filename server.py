@@ -40,12 +40,13 @@ SL_TRAIN_POLL_SECS   = int(os.getenv("SL_TRAIN_POLL_SECS", "60"))   # cada 60s
 SL_TRAIN_LIMIT       = int(os.getenv("SL_TRAIN_LIMIT", "500"))      # batch size
 SL_TRAIN_CRON_ENABLE = os.getenv("SL_TRAIN_CRON_ENABLED", "1") == "1"
 
+# ⚠️ Por pedido: recrear físicamente 'windows' si ya existe para aplicar el nuevo orden
+FORCE_RECREATE_WINDOWS = os.getenv("FORCE_RECREATE_WINDOWS", "1") == "1"
+
 # ---------- Cache en memoria de etiqueta vigente por sesión ----------
-# Clave: session_id (grupo)  Valor: str (label vigente)
 SESSION_ACTIVITY: Dict[int, str] = {}
 
 # ---------- Bootstrap de primeras N ventanas con etiqueta inicial ----------
-# Clave: session_id (grupo)  Valor: ventanas restantes por forzar etiqueta inicial
 SESSION_BOOTSTRAP: Dict[int, int] = {}
 
 # ---------- Telemetría simple en memoria ----------
@@ -95,11 +96,26 @@ CREATE INDEX IF NOT EXISTS idx_intervals_user    ON intervalos_label (id_usuario
 CREATE INDEX IF NOT EXISTS idx_intervals_session ON intervalos_label (session_id);
 """
 
+# ===== NUEVO ORDEN DE COLUMNAS EN WINDOWS =====
+# Después de session_id: etiqueta, pred_label, confianza, actividad, precision,
+# sl_trained, actividad_b, precision_b, sl_trained_b; luego el resto.
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
   id_usuario       BIGINT REFERENCES users(id_usuario),
   session_id       BIGINT REFERENCES intervalos_label(id),
+
+  etiqueta         TEXT,
+  pred_label       TEXT,
+  confianza        DOUBLE PRECISION,
+  actividad        TEXT,
+  precision        DOUBLE PRECISION,
+  sl_trained       BOOLEAN NOT NULL DEFAULT FALSE,
+
+  actividad_b      TEXT,
+  precision_b      DOUBLE PRECISION,
+  sl_trained_b     BOOLEAN NOT NULL DEFAULT FALSE,
+
   received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   start_time       TIMESTAMPTZ NOT NULL,
   end_time         TIMESTAMPTZ NOT NULL,
@@ -111,12 +127,6 @@ CREATE TABLE IF NOT EXISTS windows (
   start_index      BIGINT,
   end_index        BIGINT,
   n_muestras       INT,
-  etiqueta         TEXT,
-
-  pred_label       TEXT,
-  confianza        DOUBLE PRECISION,
-  precision        DOUBLE PRECISION,
-  actividad        TEXT,
 
   ax_mean          DOUBLE PRECISION, ax_std DOUBLE PRECISION, ax_min DOUBLE PRECISION, ax_max DOUBLE PRECISION, ax_range DOUBLE PRECISION,
   ay_mean          DOUBLE PRECISION, ay_std DOUBLE PRECISION, ay_min DOUBLE PRECISION, ay_max DOUBLE PRECISION, ay_range DOUBLE PRECISION,
@@ -129,12 +139,7 @@ CREATE TABLE IF NOT EXISTS windows (
   pitch_mean       DOUBLE PRECISION, pitch_std DOUBLE PRECISION, pitch_min DOUBLE PRECISION, pitch_max DOUBLE PRECISION, pitch_range DOUBLE PRECISION,
   roll_mean        DOUBLE PRECISION, roll_std DOUBLE PRECISION, roll_min DOUBLE PRECISION, roll_max DOUBLE PRECISION, roll_range DOUBLE PRECISION,
 
-  acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION,
-
-  sl_trained       BOOLEAN NOT NULL DEFAULT FALSE,
-  actividad_b      TEXT,
-  precision_b      DOUBLE PRECISION,
-  sl_trained_b     BOOLEAN NOT NULL DEFAULT FALSE
+  acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
@@ -321,19 +326,18 @@ ALTER TABLE windows
 
 -- WINDOWS: columnas del modelo (por si faltaran)
 ALTER TABLE windows
-  ADD COLUMN IF NOT EXISTS pred_label  TEXT,
-  ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
-  ADD COLUMN IF NOT EXISTS precision   DOUBLE PRECISION,
-  ADD COLUMN IF NOT EXISTS actividad   TEXT,
-  ADD COLUMN IF NOT EXISTS sl_trained  BOOLEAN NOT NULL DEFAULT FALSE,
-  ADD COLUMN IF NOT EXISTS actividad_b   TEXT,
-  ADD COLUMN IF NOT EXISTS precision_b   DOUBLE PRECISION,
-  ADD COLUMN IF NOT EXISTS sl_trained_b  BOOLEAN NOT NULL DEFAULT FALSE;
+  ADD COLUMN IF NOT EXISTS pred_label   TEXT,
+  ADD COLUMN IF NOT EXISTS confianza    DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS precision    DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS actividad    TEXT,
+  ADD COLUMN IF NOT EXISTS sl_trained   BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS actividad_b  TEXT,
+  ADD COLUMN IF NOT EXISTS precision_b  DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS sl_trained_b BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- ===== NUEVO: migración defensiva para sl_models y sl_models_b =====
 DO $$
 BEGIN
-  -- sl_models: asegurar columnas y defaults
   IF to_regclass('public.sl_models') IS NULL THEN
     CREATE TABLE sl_models (
       id           BIGSERIAL PRIMARY KEY,
@@ -353,15 +357,10 @@ BEGIN
     ADD COLUMN IF NOT EXISTS metric      JSONB,
     ADD COLUMN IF NOT EXISTS model_bytes BYTEA,
     ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ DEFAULT NOW();
-
-  -- Normaliza promoted (default y nulos)
   ALTER TABLE sl_models ALTER COLUMN promoted SET DEFAULT FALSE;
   UPDATE sl_models SET promoted = FALSE WHERE promoted IS NULL;
-
-  -- Índice por created_at
   CREATE INDEX IF NOT EXISTS idx_sl_models_created ON sl_models (created_at DESC);
 
-  -- sl_models_b: asegurar columnas y defaults
   IF to_regclass('public.sl_models_b') IS NULL THEN
     CREATE TABLE sl_models_b (
       id           BIGSERIAL PRIMARY KEY,
@@ -381,12 +380,8 @@ BEGIN
     ADD COLUMN IF NOT EXISTS metric      JSONB,
     ADD COLUMN IF NOT EXISTS model_bytes BYTEA,
     ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ DEFAULT NOW();
-
-  -- Normaliza promoted (default y nulos)
   ALTER TABLE sl_models_b ALTER COLUMN promoted SET DEFAULT FALSE;
   UPDATE sl_models_b SET promoted = FALSE WHERE promoted IS NULL;
-
-  -- Índice por created_at
   CREATE INDEX IF NOT EXISTS idx_sl_models_b_created ON sl_models_b (created_at DESC);
 END $$;
 """
@@ -479,14 +474,16 @@ WHERE session_id = $2
   AND end_time <= (NOW() AT TIME ZONE 'UTC');
 """
 
+# ===== IMPORTANTE: INSERT con el NUEVO ORDEN DE COLUMNAS =====
 WINDOWS_INSERT_SQL = """
 INSERT INTO windows (
   id_usuario, session_id,
+  etiqueta, pred_label, confianza, actividad, precision, sl_trained,
+  actividad_b, precision_b, sl_trained_b,
+
   received_at, start_time, end_time, sample_count, sample_rate_hz,
   features, samples_json,
-  start_index, end_index, n_muestras, etiqueta,
-
-  pred_label, confianza, precision, actividad,
+  start_index, end_index, n_muestras,
 
   ax_mean, ax_std, ax_min, ax_max, ax_range,
   ay_mean, ay_std, ay_min, ay_max, ay_range,
@@ -502,24 +499,25 @@ INSERT INTO windows (
   acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range
 ) VALUES (
   $1, $2,
-  $3, $4, $5, $6, $7,
-  $8::jsonb, $9::jsonb,
-  $10, $11, $12, $13,
+  $3, $4, $5, $6, $7, $8,
+  $9, $10, $11,
 
-  $14, $15, $16, $17,
+  $12, $13, $14, $15, $16,
+  $17::jsonb, $18::jsonb,
+  $19, $20, $21,
 
-  $18, $19, $20, $21, $22,
-  $23, $24, $25, $26, $27,
-  $28, $29, $30, $31, $32,
+  $22, $23, $24, $25, $26,
+  $27, $28, $29, $30, $31,
+  $32, $33, $34, $35, $36,
 
-  $33, $34, $35, $36, $37,
-  $38, $39, $40, $41, $42,
-  $43, $44, $45, $46, $47,
+  $37, $38, $39, $40, $41,
+  $42, $43, $44, $45, $46,
+  $47, $48, $49, $50, $51,
 
-  $48, $49, $50, $51, $52,
-  $53, $54, $55, $56, $57,
+  $52, $53, $54, $55, $56,
+  $57, $58, $59, $60, $61,
 
-  $58, $59, $60, $61, $62
+  $62, $63, $64, $65, $66
 )
 RETURNING id;
 """
@@ -595,16 +593,13 @@ def _is_nullish(v) -> bool:
     return s in ("", "null", "none", "na", "sin prediccion")
 
 def _mode_with_null(labels):
-    """Devuelve (winner_or_None, counts_dict_including_None).
-    Empate: se prefiere una etiqueta NO nula."""
+    """Devuelve (winner_or_None, counts_dict_including_None). Empate: se prefiere una etiqueta NO nula."""
     counts = {}
     for lab in labels:
         key = None if _is_nullish(lab) else str(lab).strip()
         counts[key] = counts.get(key, 0) + 1
-
     if not counts:
         return None, {}
-
     winner, maxc = None, -1
     for k, c in counts.items():
         if c > maxc:
@@ -616,14 +611,12 @@ def _mode_with_null(labels):
 
 # ---------- Notificaciones HTTP con reintentos ----------
 def _post_predict_sync(win_id: int):
-    """Bloqueante: POSTea el id al modelo con reintentos/backoff.
-    Se ejecuta en un hilo (run_in_executor), así que time.sleep no bloquea el loop."""
+    """Bloqueante: POSTea el id al modelo con reintentos/backoff."""
     data = json.dumps({"id": win_id}).encode("utf-8")
     attempt = 0
-    max_attempts = 4            # 1 intento inicial + 3 reintentos
-    backoff_base = 0.7          # segundos
-    backoff_cap = 6.0           # máximo entre intentos
-
+    max_attempts = 4
+    backoff_base = 0.7
+    backoff_cap = 6.0
     while True:
         attempt += 1
         req = urllib.request.Request(
@@ -641,10 +634,8 @@ def _post_predict_sync(win_id: int):
                 if code != 200:
                     if attempt < max_attempts:
                         METRICS["predict_retry"] += 1
-                        delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
-                        delay += random.uniform(0, 0.4)
-                        time.sleep(delay)
-                        continue
+                        delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
+                        time.sleep(delay); continue
                     METRICS["predict_fail"] += 1
                     print(f"⚠️ Modelo respondió {code} tras {attempt} intentos (dt={dt:.0f}ms). {_metrics_dump()}")
                 else:
@@ -653,23 +644,17 @@ def _post_predict_sync(win_id: int):
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
             if attempt < max_attempts:
                 METRICS["predict_retry"] += 1
-                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
-                delay += random.uniform(0, 0.6)
-                time.sleep(delay)
-                continue
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1))) + random.uniform(0, 0.6)
+                time.sleep(delay); continue
             METRICS["predict_fail"] += 1
-            print(f"⚠️ Error notificando al modelo tras {attempt} intentos: {e}. {_metrics_dump()}")
-            return
+            print(f"⚠️ Error notificando al modelo tras {attempt} intentos: {e}. {_metrics_dump()}"); return
         except Exception as e:
             if attempt < max_attempts:
                 METRICS["predict_retry"] += 1
-                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
-                delay += random.uniform(0, 0.6)
-                time.sleep(delay)
-                continue
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1))) + random.uniform(0, 0.6)
+                time.sleep(delay); continue
             METRICS["predict_fail"] += 1
-            print(f"💥 Error notificando al modelo tras {attempt} intentos: {e}. {_metrics_dump()}")
-            return
+            print(f"💥 Error notificando al modelo tras {attempt} intentos: {e}. {_metrics_dump()}"); return
 
 async def notify_model(win_id: int):
     """Envía el id en background sin bloquear el event loop."""
@@ -697,32 +682,24 @@ def _post_policy_labeled_sync(uid: int, session_id: int, when_dt: Optional[datet
             method="POST",
         )
         try:
-            t0 = time.time()
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
                 _ = resp.read()
-                dt = (time.time() - t0) * 1000
                 METRICS["policy_ok"] += 1
                 return
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
             if attempt < max_attempts:
                 METRICS["policy_retry"] += 1
-                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
-                delay += random.uniform(0, 0.5)
-                time.sleep(delay)
-                continue
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+                time.sleep(delay); continue
             METRICS["policy_fail"] += 1
-            print(f"⚠️ policy/labeled falló tras {attempt} intentos: {e}. {_metrics_dump()}")
-            return
+            print(f"⚠️ policy/labeled falló tras {attempt} intentos: {e}. {_metrics_dump()}"); return
         except Exception as e:
             if attempt < max_attempts:
                 METRICS["policy_retry"] += 1
-                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
-                delay += random.uniform(0, 0.5)
-                time.sleep(delay)
-                continue
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+                time.sleep(delay); continue
             METRICS["policy_fail"] += 1
-            print(f"⚠️ policy/labeled error tras {attempt} intentos: {e}. {_metrics_dump()}")
-            return
+            print(f"⚠️ policy/labeled error tras {attempt} intentos: {e}. {_metrics_dump()}"); return
 
 async def notify_policy_labeled(uid: int, session_id: int, when_dt: Optional[datetime] = None):
     loop = asyncio.get_running_loop()
@@ -832,7 +809,7 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         new_id,
         user_id,
         label.strip(),
-        (reason or "").strip() or 'initial',  # aseguramos initial por defecto
+        (reason or "").strip() or 'initial',
         now
     )
 
@@ -879,6 +856,82 @@ async def init_db():
         await conn.execute(CREATE_SL_MODELS_B_SQL)
         # Migraciones defensivas
         await conn.execute(MIGRATE_SQL)
+
+        # ⚠️ Re-crear tabla 'windows' para aplicar orden físico de columnas (si ya existía)
+        if FORCE_RECREATE_WINDOWS:
+            # Creamos tabla nueva con el orden deseado
+            await conn.execute("DROP TABLE IF EXISTS windows_new;")
+            await conn.execute(CREATE_WINDOWS_SQL.replace("windows", "windows_new", 1))
+
+            # Copiamos datos columna-a-columna compatible por nombre
+            await conn.execute("""
+                INSERT INTO windows_new (
+                  id, id_usuario, session_id,
+                  etiqueta, pred_label, confianza, actividad, precision, sl_trained,
+                  actividad_b, precision_b, sl_trained_b,
+                  received_at, start_time, end_time, sample_count, sample_rate_hz,
+                  features, samples_json,
+                  start_index, end_index, n_muestras,
+                  ax_mean, ax_std, ax_min, ax_max, ax_range,
+                  ay_mean, ay_std, ay_min, ay_max, ay_range,
+                  az_mean, az_std, az_min, az_max, az_range,
+                  gx_mean, gx_std, gx_min, gx_max, gx_range,
+                  gy_mean, gy_std, gy_min, gy_max, gy_range,
+                  gz_mean, gz_std, gz_min, gz_max, gz_range,
+                  pitch_mean, pitch_std, pitch_min, pitch_max, pitch_range,
+                  roll_mean,  roll_std,  roll_min,  roll_max,  roll_range,
+                  acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range
+                )
+                SELECT
+                  id, id_usuario, session_id,
+                  etiqueta, pred_label, confianza, actividad, precision, COALESCE(sl_trained, FALSE),
+                  actividad_b, precision_b, COALESCE(sl_trained_b, FALSE),
+                  received_at, start_time, end_time, sample_count, sample_rate_hz,
+                  features, samples_json,
+                  start_index, end_index, n_muestras,
+                  ax_mean, ax_std, ax_min, ax_max, ax_range,
+                  ay_mean, ay_std, ay_min, ay_max, ay_range,
+                  az_mean, az_std, az_min, az_max, az_range,
+                  gx_mean, gx_std, gx_min, gx_max, gx_range,
+                  gy_mean, gy_std, gy_min, gy_max, gy_range,
+                  gz_mean, gz_std, gz_min, gz_max, gz_range,
+                  pitch_mean, pitch_std, pitch_min, pitch_max, pitch_range,
+                  roll_mean,  roll_std,  roll_min,  roll_max,  roll_range,
+                  acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range
+                FROM windows;
+            """)
+            # Reemplazamos tablas
+            await conn.execute("DROP TABLE windows;")
+            await conn.execute("ALTER TABLE windows_new RENAME TO windows;")
+            # Re-crear índices (por si se perdieron con el rename)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
+                CREATE INDEX IF NOT EXISTS idx_windows_start_index ON windows (start_index);
+                CREATE INDEX IF NOT EXISTS idx_windows_end_index   ON windows (end_index);
+                CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
+                CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
+            """)
+            # Reforzar FK tras recreate
+            await conn.execute("""
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.table_constraints
+                    WHERE table_name = 'windows'
+                      AND constraint_type = 'FOREIGN KEY'
+                      AND constraint_name = 'windows_session_id_fkey'
+                  ) THEN
+                    ALTER TABLE windows
+                      ADD CONSTRAINT windows_session_id_fkey
+                      FOREIGN KEY (session_id) REFERENCES intervalos_label(id)
+                      ON DELETE SET NULL;
+                  END IF;
+                END $$;
+            """)
+            print("✅ Tabla 'windows' recreada con el nuevo orden de columnas.")
+
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
 
 # ---------- Save window ----------
@@ -924,24 +977,30 @@ async def save_window(item: Dict[str, Any]) -> int:
                 row = await conn.fetchrow(GET_INITIAL_ROW_FOR_SESSION_SQL, interval_id)
             if row and row["label"]:
                 etiqueta = str(row["label"]).strip() or None
-            # decrementamos siempre que se intentó forzar (tenga o no label válida)
             SESSION_BOOTSTRAP[interval_id] = max(0, remaining - 1)
 
-    pred_label   = None
+    # Datos de predicción/online al insertar se dejan nulos (los setea el modelo)
+    pred_label   = None   # offline
     confianza    = None
+    actividad    = None   # online (Hoeffding Tree)
     precision    = None
-    actividad    = None
+    sl_trained   = False
+
+    actividad_b  = None   # online (Adaptive Random Forest)
+    precision_b  = None
+    sl_trained_b = False
 
     def f(k): return _normf(feats.get(k))
 
     args = [
         id_usuario, interval_id,
+        etiqueta, pred_label, confianza, actividad, precision, sl_trained,
+        actividad_b, precision_b, sl_trained_b,
+
         received_at, start_time, end_time, sample_count, sample_rate,
         json.dumps(feats, ensure_ascii=False),
         json.dumps(samples, ensure_ascii=False) if samples is not None else None,
-        start_index, end_index, n_muestras, etiqueta,
-
-        pred_label, confianza, precision, actividad,
+        start_index, end_index, n_muestras,
 
         f("ax_mean"), f("ax_std"), f("ax_min"), f("ax_max"), f("ax_range"),
         f("ay_mean"), f("ay_std"), f("ay_min"), f("ay_max"), f("ay_range"),
@@ -1120,7 +1179,7 @@ async def handle_connection(websocket):
                                 "reason": row["reason"]
                             })); continue
 
-                        # ===== NUEVO RPC: modo (actividad más frecuente) en 10 s =====
+                        # ===== NUEVO RPC: modo (actividad más frecuente) =====
                         elif typ == "get_predictions_mode":
                             # Params: session_id (o interval_id), horizon_sec (opcional, default 10)
                             session_id = data.get("session_id")
@@ -1146,7 +1205,7 @@ async def handle_connection(websocket):
                             if horizon > 120: horizon = 120
 
                             rows = await conn.fetch("""
-                                SELECT pred_label, actividad
+                                SELECT pred_label, actividad, actividad_b
                                   FROM windows
                                  WHERE session_id = $1
                                    AND end_time >= (NOW() AT TIME ZONE 'UTC') - ($2::int * INTERVAL '1 second')
@@ -1154,21 +1213,35 @@ async def handle_connection(websocket):
                                  ORDER BY end_time DESC
                             """, sid, horizon)
 
-                            pre_labels = [r["pred_label"] for r in rows]
-                            sl_labels  = [r["actividad"]  for r in rows]
+                            pre_labels = [r["pred_label"] for r in rows]     # OFFLINE
+                            ht_labels  = [r["actividad"]  for r in rows]     # ONLINE Hoeffding Tree
+                            arf_labels = [r["actividad_b"] for r in rows]    # ONLINE Adaptive Random Forest
 
                             pre_mode, pre_counts = _mode_with_null(pre_labels)
-                            sl_mode,  sl_counts  = _mode_with_null(sl_labels)
+                            ht_mode,  ht_counts  = _mode_with_null(ht_labels)
+                            arf_mode, arf_counts = _mode_with_null(arf_labels)
 
                             resp = {
                                 "ok": True,
                                 "session_id": sid,
                                 "horizon_sec": horizon,
-                                "pred_label_mode": pre_mode,   # puede ser None
-                                "actividad_mode":  sl_mode,    # puede ser None
+
+                                # Compatibilidad anterior:
+                                "pred_label_mode": pre_mode,
+                                "actividad_mode":  ht_mode,
+
+                                # Nuevo layout agrupado:
+                                "offline": {
+                                    "pred_label_mode": pre_mode
+                                },
+                                "online": {
+                                    "hoeffding_tree_mode": ht_mode,
+                                    "adaptive_random_forest_mode": arf_mode
+                                },
                                 "counts": {
-                                    "pred_label": { ("" if k is None else k): v for k, v in pre_counts.items() },
-                                    "actividad":  { ("" if k is None else k): v for k, v in sl_counts.items() },
+                                    "pred_label":  { ("" if k is None else k): v for k, v in pre_counts.items() },
+                                    "actividad":   { ("" if k is None else k): v for k, v in ht_counts.items() },
+                                    "actividad_b": { ("" if k is None else k): v for k, v in arf_counts.items() },
                                 },
                                 "windows_considered": len(rows),
                             }
