@@ -1229,6 +1229,7 @@ async def handle_connection(websocket):
                                 # Compatibilidad anterior:
                                 "pred_label_mode": pre_mode,
                                 "actividad_mode":  ht_mode,
+                                "actividad_b_mode": arf_mode,  # 👈 alias para Flutter (ARF)
 
                                 # Nuevo layout agrupado:
                                 "offline": {
