@@ -131,7 +131,10 @@ CREATE TABLE IF NOT EXISTS windows (
 
   acc_mag_mean     DOUBLE PRECISION, acc_mag_std DOUBLE PRECISION, acc_mag_min DOUBLE PRECISION, acc_mag_max DOUBLE PRECISION, acc_mag_range DOUBLE PRECISION,
 
-  sl_trained       BOOLEAN NOT NULL DEFAULT FALSE
+  sl_trained       BOOLEAN NOT NULL DEFAULT FALSE,
+  actividad_b      TEXT,
+  precision_b      DOUBLE PRECISION,
+  sl_trained_b     BOOLEAN
 );
 CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
@@ -295,7 +298,10 @@ ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS confianza   DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS precision   DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS actividad   TEXT,
-  ADD COLUMN IF NOT EXISTS sl_trained  BOOLEAN NOT NULL DEFAULT FALSE;
+  ADD COLUMN IF NOT EXISTS sl_trained  BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS actividad_b   TEXT,
+  ADD COLUMN IF NOT EXISTS precision_b   DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS sl_trained_b  BOOLEAN;
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
