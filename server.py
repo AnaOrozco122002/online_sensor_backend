@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS windows (
   sl_trained       BOOLEAN NOT NULL DEFAULT FALSE,
   actividad_b      TEXT,
   precision_b      DOUBLE PRECISION,
-  sl_trained_b     BOOLEAN
+  sl_trained_b     BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
@@ -144,7 +144,34 @@ CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
 """
 
-# MIGRACIÓN DEFENSIVA: elimina UNIQUE en session_id y asegura índices/FKs y nueva columna
+# === NUEVO: tablas de tu compañera (A y B) ===
+CREATE_SL_MODELS_SQL = """
+CREATE TABLE IF NOT EXISTS sl_models (
+  id           BIGSERIAL PRIMARY KEY,
+  algo         TEXT,
+  promoted     BOOLEAN DEFAULT FALSE,
+  n_updates    INTEGER,
+  metric       JSONB,
+  model_bytes  BYTEA,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sl_models_created ON sl_models (created_at DESC);
+"""
+
+CREATE_SL_MODELS_B_SQL = """
+CREATE TABLE IF NOT EXISTS sl_models_b (
+  id           BIGSERIAL PRIMARY KEY,
+  algo         TEXT,
+  promoted     BOOLEAN DEFAULT FALSE,
+  n_updates    INTEGER,
+  metric       JSONB,
+  model_bytes  BYTEA,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sl_models_b_created ON sl_models_b (created_at DESC);
+"""
+
+# MIGRACIÓN DEFENSIVA: elimina UNIQUE en session_id y asegura índices/FKs y nuevas columnas
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -301,7 +328,67 @@ ALTER TABLE windows
   ADD COLUMN IF NOT EXISTS sl_trained  BOOLEAN NOT NULL DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS actividad_b   TEXT,
   ADD COLUMN IF NOT EXISTS precision_b   DOUBLE PRECISION,
-  ADD COLUMN IF NOT EXISTS sl_trained_b  BOOLEAN;
+  ADD COLUMN IF NOT EXISTS sl_trained_b  BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ===== NUEVO: migración defensiva para sl_models y sl_models_b =====
+DO $$
+BEGIN
+  -- sl_models: asegurar columnas y defaults
+  IF to_regclass('public.sl_models') IS NULL THEN
+    CREATE TABLE sl_models (
+      id           BIGSERIAL PRIMARY KEY,
+      algo         TEXT,
+      promoted     BOOLEAN DEFAULT FALSE,
+      n_updates    INTEGER,
+      metric       JSONB,
+      model_bytes  BYTEA,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+  END IF;
+
+  ALTER TABLE sl_models
+    ADD COLUMN IF NOT EXISTS algo        TEXT,
+    ADD COLUMN IF NOT EXISTS promoted    BOOLEAN,
+    ADD COLUMN IF NOT EXISTS n_updates   INTEGER,
+    ADD COLUMN IF NOT EXISTS metric      JSONB,
+    ADD COLUMN IF NOT EXISTS model_bytes BYTEA,
+    ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ DEFAULT NOW();
+
+  -- Normaliza promoted (default y nulos)
+  ALTER TABLE sl_models ALTER COLUMN promoted SET DEFAULT FALSE;
+  UPDATE sl_models SET promoted = FALSE WHERE promoted IS NULL;
+
+  -- Índice por created_at
+  CREATE INDEX IF NOT EXISTS idx_sl_models_created ON sl_models (created_at DESC);
+
+  -- sl_models_b: asegurar columnas y defaults
+  IF to_regclass('public.sl_models_b') IS NULL THEN
+    CREATE TABLE sl_models_b (
+      id           BIGSERIAL PRIMARY KEY,
+      algo         TEXT,
+      promoted     BOOLEAN DEFAULT FALSE,
+      n_updates    INTEGER,
+      metric       JSONB,
+      model_bytes  BYTEA,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+  END IF;
+
+  ALTER TABLE sl_models_b
+    ADD COLUMN IF NOT EXISTS algo        TEXT,
+    ADD COLUMN IF NOT EXISTS promoted    BOOLEAN,
+    ADD COLUMN IF NOT EXISTS n_updates   INTEGER,
+    ADD COLUMN IF NOT EXISTS metric      JSONB,
+    ADD COLUMN IF NOT EXISTS model_bytes BYTEA,
+    ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ DEFAULT NOW();
+
+  -- Normaliza promoted (default y nulos)
+  ALTER TABLE sl_models_b ALTER COLUMN promoted SET DEFAULT FALSE;
+  UPDATE sl_models_b SET promoted = FALSE WHERE promoted IS NULL;
+
+  -- Índice por created_at
+  CREATE INDEX IF NOT EXISTS idx_sl_models_b_created ON sl_models_b (created_at DESC);
+END $$;
 """
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
@@ -767,7 +854,7 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         "start_ts": row["start_ts"].isoformat()
     }
 
-# stop por SESSION (no tocamos end_ts, solo reason='finish' en la última fila del grupo)
+# stop por SESSION (no tocamos end_ts, solo reason='finish' en la última fila por session_id)
 async def stop_session_by_session(conn: asyncpg.Connection, session_id: int):
     row = await conn.fetchrow(STOP_BY_SESSION_SQL, session_id)
     if not row:
@@ -787,6 +874,10 @@ async def init_db():
         await conn.execute(CREATE_USERS_SQL)
         await conn.execute(CREATE_INTERVALS_SQL)
         await conn.execute(CREATE_WINDOWS_SQL)
+        # Tablas de modelos (A y B)
+        await conn.execute(CREATE_SL_MODELS_SQL)
+        await conn.execute(CREATE_SL_MODELS_B_SQL)
+        # Migraciones defensivas
         await conn.execute(MIGRATE_SQL)
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
 
