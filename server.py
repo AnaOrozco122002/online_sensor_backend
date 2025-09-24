@@ -36,12 +36,12 @@ HTTP_TIMEOUT_SECS = 12  # timeout más holgado
 
 # === Entrenador periódico de SL (configurable por ENV) ===
 SL_TRAIN_URL         = os.getenv("SL_TRAIN_URL", f"{PREDICT_BASE}/sl_train_pending")
-SL_TRAIN_POLL_SECS   = int(os.getenv("SL_TRAIN_POLL_SECS", "60"))   # cada 60s
+SL_TRAIN_POLL_SECS   = int(os.getenv("SL_TRAIN_POLL_SECS", "30"))   # ⬅️ cambio: 60 -> 30
 SL_TRAIN_LIMIT       = int(os.getenv("SL_TRAIN_LIMIT", "500"))      # batch size
 SL_TRAIN_CRON_ENABLE = os.getenv("SL_TRAIN_CRON_ENABLED", "1") == "1"
 
-# ⚠️ Por pedido: recrear físicamente 'windows' si ya existe para aplicar el nuevo orden
-FORCE_RECREATE_WINDOWS = os.getenv("FORCE_RECREATE_WINDOWS", "1") == "1"
+# ⚠️ Reorden físico de 'windows' (desactivado por defecto)
+FORCE_RECREATE_WINDOWS = os.getenv("FORCE_RECREATE_WINDOWS", "0") == "1"  # ⬅️ cambio: 1 -> 0
 
 # ---------- Cache en memoria de etiqueta vigente por sesión ----------
 SESSION_ACTIVITY: Dict[int, str] = {}
@@ -96,9 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_intervals_user    ON intervalos_label (id_usuario
 CREATE INDEX IF NOT EXISTS idx_intervals_session ON intervalos_label (session_id);
 """
 
-# ===== NUEVO ORDEN DE COLUMNAS EN WINDOWS =====
-# Después de session_id: etiqueta, pred_label, confianza, actividad, precision,
-# sl_trained, actividad_b, precision_b, sl_trained_b; luego el resto.
+# ===== ORDEN DE COLUMNAS EN WINDOWS =====
 CREATE_WINDOWS_SQL = """
 CREATE TABLE IF NOT EXISTS windows (
   id               BIGSERIAL PRIMARY KEY,
@@ -176,7 +174,7 @@ CREATE TABLE IF NOT EXISTS sl_models_b (
 CREATE INDEX IF NOT EXISTS idx_sl_models_b_created ON sl_models_b (created_at DESC);
 """
 
-# MIGRACIÓN DEFENSIVA: elimina UNIQUE en session_id y asegura índices/FKs y nuevas columnas
+# MIGRACIÓN DEFENSIVA
 MIGRATE_SQL = """
 -- USERS
 ALTER TABLE users
@@ -386,6 +384,18 @@ BEGIN
 END $$;
 """
 
+# ---------- Secuencias: reparar desincronización (duplicate key en PK) ----------
+REPAIR_SEQUENCES_SQL = """
+SELECT setval(pg_get_serial_sequence('intervalos_label','id'),
+              COALESCE((SELECT MAX(id) FROM intervalos_label), 0));
+SELECT setval(pg_get_serial_sequence('windows','id'),
+              COALESCE((SELECT MAX(id) FROM windows), 0));
+SELECT setval(pg_get_serial_sequence('sl_models','id'),
+              COALESCE((SELECT MAX(id) FROM sl_models), 0));
+SELECT setval(pg_get_serial_sequence('sl_models_b','id'),
+              COALESCE((SELECT MAX(id) FROM sl_models_b), 0));
+"""
+
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
 GET_USER_BY_ID_SQL    = "SELECT id_usuario, email, password_hash FROM users WHERE id_usuario = $1"
 INSERT_USER_RETURNING_SQL = """
@@ -474,7 +484,7 @@ WHERE session_id = $2
   AND end_time <= (NOW() AT TIME ZONE 'UTC');
 """
 
-# ===== IMPORTANTE: INSERT con el NUEVO ORDEN DE COLUMNAS =====
+# ===== IMPORTANTE: INSERT con el ORDEN DE COLUMNAS =====
 WINDOWS_INSERT_SQL = """
 INSERT INTO windows (
   id_usuario, session_id,
@@ -586,7 +596,7 @@ def _normi(v):
     except Exception:
         return None
 
-# ===== NUEVO: helpers de modo / etiquetas nulas =====
+# ===== helpers de modo / etiquetas nulas =====
 def _is_nullish(v) -> bool:
     if v is None: return True
     s = str(v).strip().lower()
@@ -831,12 +841,11 @@ async def start_session(conn: asyncpg.Connection, user_id: int, label: str, reas
         "start_ts": row["start_ts"].isoformat()
     }
 
-# stop por SESSION (no tocamos end_ts, solo reason='finish' en la última fila por session_id)
+# stop por SESSION
 async def stop_session_by_session(conn: asyncpg.Connection, session_id: int):
     row = await conn.fetchrow(STOP_BY_SESSION_SQL, session_id)
     if not row:
         return {"ok": False, "code": "not_found", "message": "Sesión no encontrada"}
-    # al finalizar sesión, por seguridad ponemos bootstrap a 0
     SESSION_BOOTSTRAP[session_id] = 0
     return {"ok": True, "interval_id": row["id"], "session_id": row["session_id"], "reason": row["reason"]}
 
@@ -857,13 +866,10 @@ async def init_db():
         # Migraciones defensivas
         await conn.execute(MIGRATE_SQL)
 
-        # ⚠️ Re-crear tabla 'windows' para aplicar orden físico de columnas (si ya existía)
+        # Re-crear tabla 'windows' (DESACTIVADO salvo que se active por ENV)
         if FORCE_RECREATE_WINDOWS:
-            # Creamos tabla nueva con el orden deseado
             await conn.execute("DROP TABLE IF EXISTS windows_new;")
             await conn.execute(CREATE_WINDOWS_SQL.replace("windows", "windows_new", 1))
-
-            # Copiamos datos columna-a-columna compatible por nombre
             await conn.execute("""
                 INSERT INTO windows_new (
                   id, id_usuario, session_id,
@@ -900,10 +906,8 @@ async def init_db():
                   acc_mag_mean, acc_mag_std, acc_mag_min, acc_mag_max, acc_mag_range
                 FROM windows;
             """)
-            # Reemplazamos tablas
             await conn.execute("DROP TABLE windows;")
             await conn.execute("ALTER TABLE windows_new RENAME TO windows;")
-            # Re-crear índices (por si se perdieron con el rename)
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_windows_received_at ON windows (received_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_windows_etiqueta    ON windows (etiqueta);
@@ -912,7 +916,6 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS idx_windows_user        ON windows (id_usuario);
                 CREATE INDEX IF NOT EXISTS idx_windows_session     ON windows (session_id);
             """)
-            # Reforzar FK tras recreate
             await conn.execute("""
                 DO $$
                 BEGIN
@@ -931,6 +934,11 @@ async def init_db():
                 END $$;
             """)
             print("✅ Tabla 'windows' recreada con el nuevo orden de columnas.")
+            # MUY IMPORTANTE tras recreación
+            await conn.execute(REPAIR_SEQUENCES_SQL)  # ⬅️ asegura secuencias
+
+        # Siempre reparar secuencias por si venían desincronizadas
+        await conn.execute(REPAIR_SEQUENCES_SQL)  # ⬅️ clave para evitar "duplicate key"
 
     print("🗄️  DB lista (tablas/índices/columnas verificados).")
 
@@ -957,7 +965,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     end_index    = _normi(feats.get("end_index"))
     n_muestras   = _normi(feats.get("n_muestras"))
 
-    # 1) si el cliente manda etiqueta válida, se respeta
+    # 1) etiqueta del cliente (si válida)
     etiqueta: Optional[str] = None
     try:
         lab_raw = item.get("etiqueta")
@@ -968,8 +976,7 @@ async def save_window(item: Dict[str, Any]) -> int:
     except Exception:
         etiqueta = None
 
-    # 2) si NO vino etiqueta y aún quedan N ventanas por bootstrap,
-    #    tomamos la etiqueta inicial de intervalos_label (reason='initial')
+    # 2) bootstrap de N ventanas con etiqueta inicial
     if etiqueta is None and interval_id is not None:
         remaining = SESSION_BOOTSTRAP.get(interval_id, 0)
         if remaining > 0:
@@ -979,14 +986,14 @@ async def save_window(item: Dict[str, Any]) -> int:
                 etiqueta = str(row["label"]).strip() or None
             SESSION_BOOTSTRAP[interval_id] = max(0, remaining - 1)
 
-    # Datos de predicción/online al insertar se dejan nulos (los setea el modelo)
-    pred_label   = None   # offline
+    # Campos que llenará el modelo
+    pred_label   = None
     confianza    = None
-    actividad    = None   # online (Hoeffding Tree)
+    actividad    = None
     precision    = None
     sl_trained   = False
 
-    actividad_b  = None   # online (Adaptive Random Forest)
+    actividad_b  = None
     precision_b  = None
     sl_trained_b = False
 
@@ -1019,11 +1026,10 @@ async def save_window(item: Dict[str, Any]) -> int:
     async with POOL.acquire() as conn:
         win_id = await conn.fetchval(WINDOWS_INSERT_SQL, *args)
 
-    # Lanza notificación al modelo en background (solo id)
+    # Notificar al modelo (no bloquea)
     asyncio.create_task(notify_model(win_id))
 
     return win_id
-
 
 # ---------- WS ----------
 async def handle_connection(websocket):
@@ -1073,7 +1079,6 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "stop_session":
-                            # Compatibilidad: aceptar session_id o interval_id
                             session_id = data.get("session_id")
                             interval_id = data.get("interval_id")
                             try:
@@ -1093,7 +1098,6 @@ async def handle_connection(websocket):
                             await websocket.send(json.dumps(resp)); continue
 
                         elif typ == "get_interval_reason":
-                            # Compat: aceptar interval_id o session_id; devolver la ÚLTIMA fila del session_id
                             session_id = data.get("session_id")
                             interval_id = data.get("interval_id")
                             try:
@@ -1123,7 +1127,6 @@ async def handle_connection(websocket):
                             })); continue
 
                         elif typ == "apply_interval_feedback":
-                            # Compat: aceptar interval_id o session_id; aplicar sobre la ÚLTIMA fila del session_id
                             new_label = (data.get("label") or "").strip()
                             try:
                                 dur = int(data.get("duracion") or 0)
@@ -1151,16 +1154,16 @@ async def handle_connection(websocket):
                             if not row:
                                 await websocket.send(json.dumps({"ok": False, "code": "not_found", "message": "Sesión no encontrada"})); continue
 
-                            # 2) Backfill de ventanas previas (ahora - dur .. ahora)
+                            # Backfill de ventanas
                             try:
                                 await conn.execute(WINDOWS_BACKFILL_SQL, new_label, sid, dur)
                             except Exception as e:
                                 print(f"⚠️ Backfill windows falló: {e}")
 
-                            # 3) Actualiza etiqueta vigente en cache para futuras ventanas
+                            # Actualiza etiqueta vigente cache
                             SESSION_ACTIVITY[sid] = new_label
 
-                            # 4) 🔔 Notificar al motor de políticas que el usuario etiquetó ahora
+                            # Notificar policy
                             try:
                                 uid_for_policy = await conn.fetchval(GET_USER_FOR_SESSION_SQL, sid)
                                 if uid_for_policy:
@@ -1179,9 +1182,8 @@ async def handle_connection(websocket):
                                 "reason": row["reason"]
                             })); continue
 
-                        # ===== NUEVO RPC: modo (actividad más frecuente) =====
+                        # ===== RPC: modo (actividad más frecuente) =====
                         elif typ == "get_predictions_mode":
-                            # Params: session_id (o interval_id), horizon_sec (opcional, default 10)
                             session_id = data.get("session_id")
                             interval_id = data.get("interval_id")
                             try:
@@ -1225,13 +1227,9 @@ async def handle_connection(websocket):
                                 "ok": True,
                                 "session_id": sid,
                                 "horizon_sec": horizon,
-
-                                # Compatibilidad anterior:
                                 "pred_label_mode": pre_mode,
                                 "actividad_mode":  ht_mode,
-                                "actividad_b_mode": arf_mode,  # 👈 alias para Flutter (ARF)
-
-                                # Nuevo layout agrupado:
+                                "actividad_b_mode": arf_mode,
                                 "offline": {
                                     "pred_label_mode": pre_mode
                                 },
@@ -1306,7 +1304,7 @@ async def sl_trainer_loop():
                 if SL_TRAIN_CRON_ENABLE:
                     payload = {"limit": SL_TRAIN_LIMIT}
                     async with session.post(SL_TRAIN_URL, json=payload) as resp:
-                        _ = await resp.text()  # consumir respuesta (libera conexión)
+                        _ = await resp.text()  # consumir respuesta
             except Exception:
                 pass
 
