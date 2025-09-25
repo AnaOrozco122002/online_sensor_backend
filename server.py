@@ -386,15 +386,35 @@ END $$;
 
 # ---------- Secuencias: reparar desincronización (duplicate key en PK) ----------
 REPAIR_SEQUENCES_SQL = """
-SELECT setval(pg_get_serial_sequence('intervalos_label','id'),
-              COALESCE((SELECT MAX(id) FROM intervalos_label), 0));
-SELECT setval(pg_get_serial_sequence('windows','id'),
-              COALESCE((SELECT MAX(id) FROM windows), 0));
-SELECT setval(pg_get_serial_sequence('sl_models','id'),
-              COALESCE((SELECT MAX(id) FROM sl_models), 0));
-SELECT setval(pg_get_serial_sequence('sl_models_b','id'),
-              COALESCE((SELECT MAX(id) FROM sl_models_b), 0));
+-- intervalos_label.id
+SELECT setval(
+  pg_get_serial_sequence('intervalos_label','id'),
+  COALESCE((SELECT MAX(id) FROM intervalos_label), 1),
+  (SELECT COUNT(*) > 0 FROM intervalos_label)
+);
+
+-- windows.id
+SELECT setval(
+  pg_get_serial_sequence('windows','id'),
+  COALESCE((SELECT MAX(id) FROM windows), 1),
+  (SELECT COUNT(*) > 0 FROM windows)
+);
+
+-- sl_models.id
+SELECT setval(
+  pg_get_serial_sequence('sl_models','id'),
+  COALESCE((SELECT MAX(id) FROM sl_models), 1),
+  (SELECT COUNT(*) > 0 FROM sl_models)
+);
+
+-- sl_models_b.id
+SELECT setval(
+  pg_get_serial_sequence('sl_models_b','id'),
+  COALESCE((SELECT MAX(id) FROM sl_models_b), 1),
+  (SELECT COUNT(*) > 0 FROM sl_models_b)
+);
 """
+
 
 GET_USER_BY_EMAIL_SQL = "SELECT id_usuario, email, password_hash, display_name FROM users WHERE email = $1"
 GET_USER_BY_ID_SQL    = "SELECT id_usuario, email, password_hash FROM users WHERE id_usuario = $1"
